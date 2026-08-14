@@ -66,8 +66,27 @@ export function IssueListView({
     });
   }
 
+  const allExpanded = collapsed.size === 0;
+
+  function toggleAllStatuses() {
+    setCollapsed(allExpanded ? new Set(TASK_STATUSES) : new Set());
+  }
+
   return (
     <div className="issue-list-view" ref={scrollRef}>
+      <div className="issue-list-toolbar">
+        <span>按状态查看</span>
+        <button
+          className="issue-list-expand-all"
+          type="button"
+          aria-label={allExpanded ? "折叠全部状态" : "展开全部状态"}
+          title={allExpanded ? "折叠全部状态" : "展开全部状态"}
+          onClick={toggleAllStatuses}
+        >
+          <LinearIcon name={allExpanded ? "chevronRight" : "chevronDown"} />
+          <span>{allExpanded ? "全部折叠" : "全部展开"}</span>
+        </button>
+      </div>
       <div className="issue-list-groups">
         {TASK_STATUSES.map((status) => {
           const statusTasks = tasks.filter((task) => task.status === status);

@@ -1,7 +1,7 @@
 (() => {
   "use strict";
 
-  const VERSION = "0.6.13";
+  const VERSION = "0.6.14";
   const SOURCE_HASH = window.__CODEX_TASKBOARD_SOURCE_HASH__;
   const SENTINEL_KEY = "__codexTaskboardInjection__";
   const DEFAULT_TASKBOARD_URL = "http://127.0.0.1:47823/?host=codex";
@@ -77,6 +77,7 @@
   let hostContextTimer = null;
   let lastFocusedElement = null;
   let hostContextSnapshot = null;
+  let capturingHostContext = false;
   let mutedNativeSelections = new Map();
   let openGeneration = 0;
   let pendingThreadCreation = null;
@@ -417,6 +418,69 @@
       });
   }
 
+  function readCodexSidebarThreads(projects = readCodexProjects()) {
+    const projectNames = new Map(projects.map((project) => [project.id, project.name]));
+    const threads = new Map();
+    for (const row of document.querySelectorAll("[data-app-action-sidebar-thread-id]")) {
+      const threadId = normalizeThreadId(
+        row.getAttribute("data-app-action-sidebar-thread-id"),
+      );
+      const title = row.getAttribute("data-app-action-sidebar-thread-title")?.trim();
+      if (!threadId || !title) continue;
+      const projectList = row.closest("[data-app-action-sidebar-project-list-id]");
+      const codexProjectId = projectList
+        ?.getAttribute("data-app-action-sidebar-project-list-id")
+        ?.trim() || null;
+      const candidate = {
+        threadId,
+        title,
+        codexProjectId,
+        codexProjectName: codexProjectId ? projectNames.get(codexProjectId) ?? null : null,
+        kind: row.getAttribute("data-app-action-sidebar-thread-kind")?.trim() || null,
+        pinned: row.getAttribute("data-app-action-sidebar-thread-pinned") === "true",
+        active: row.getAttribute("data-app-action-sidebar-thread-active") === "true"
+          || ["page", "true"].includes(row.getAttribute("aria-current")),
+        running: Boolean(row.querySelector(".animate-spin")),
+        nativeUpdatedAt: row.getAttribute("data-app-action-sidebar-thread-updated-at")?.trim() || null,
+      };
+      const current = threads.get(threadId);
+      threads.set(threadId, current
+        ? {
+            ...current,
+            ...candidate,
+            codexProjectId: candidate.codexProjectId ?? current.codexProjectId,
+            codexProjectName: candidate.codexProjectName ?? current.codexProjectName,
+            pinned: current.pinned || candidate.pinned,
+            active: current.active || candidate.active,
+            running: current.running || candidate.running,
+          }
+        : candidate);
+    }
+    return [...threads.values()];
+  }
+
+  function mergeSidebarThreads(...snapshots) {
+    const threads = new Map();
+    for (const snapshot of snapshots) {
+      for (const candidate of snapshot ?? []) {
+        if (!candidate?.threadId) continue;
+        const current = threads.get(candidate.threadId);
+        threads.set(candidate.threadId, current
+          ? {
+              ...current,
+              ...candidate,
+              codexProjectId: candidate.codexProjectId ?? current.codexProjectId,
+              codexProjectName: candidate.codexProjectName ?? current.codexProjectName,
+              pinned: current.pinned || candidate.pinned,
+              active: current.active || candidate.active,
+              running: current.running || candidate.running,
+            }
+          : candidate);
+      }
+    }
+    return [...threads.values()];
+  }
+
   function findProjectsSection() {
     return Array.from(document.querySelectorAll("[data-app-action-sidebar-section-heading]"))
       .find((node) => PROJECT_SECTION_LABELS.includes(normalizedLabel(
@@ -461,14 +525,38 @@
         projects = readCodexProjects();
       } while ((projects.length === 0 || !activeThreadRow()) && Date.now() < deadline);
     }
-    const context = readHostContext(projects, lastNativeProjectId);
-    if (context.threadRunning && todoProgress) context.threadTodoProgress = todoProgress;
-    expandedSections.forEach((candidate) => {
-      if (candidate.isConnected && candidate.getAttribute("data-app-action-sidebar-section-collapsed") === "false") {
-        candidate.querySelector("[data-app-action-sidebar-section-toggle]")?.click();
+    const collapsedProjectIds = new Set(
+      Array.from(document.querySelectorAll("[data-app-action-sidebar-project-row][data-app-action-sidebar-project-collapsed='true']"))
+        .map((row) => row.getAttribute("data-app-action-sidebar-project-id")?.trim())
+        .filter(Boolean),
+    );
+    capturingHostContext = true;
+    try {
+      collapsedProjectIds.forEach((projectId) => projectRowById(projectId)?.click?.());
+      let previousThreadCount = -1;
+      let stableTicks = 0;
+      const projectDeadline = Date.now() + 1_200;
+      while (Date.now() < projectDeadline && stableTicks < 3) {
+        await new Promise((resolve) => window.setTimeout(resolve, 40));
+        const threadCount = document.querySelectorAll("[data-app-action-sidebar-thread-id]").length;
+        stableTicks = threadCount === previousThreadCount ? stableTicks + 1 : 0;
+        previousThreadCount = threadCount;
       }
-    });
-    return context;
+      const context = readHostContext(projects, lastNativeProjectId);
+      if (context.threadRunning && todoProgress) context.threadTodoProgress = todoProgress;
+      return context;
+    } finally {
+      collapsedProjectIds.forEach((projectId) => {
+        const row = projectRowById(projectId);
+        if (row?.getAttribute("data-app-action-sidebar-project-collapsed") === "false") row.click?.();
+      });
+      expandedSections.forEach((candidate) => {
+        if (candidate.isConnected && candidate.getAttribute("data-app-action-sidebar-section-collapsed") === "false") {
+          candidate.querySelector("[data-app-action-sidebar-section-toggle]")?.click();
+        }
+      });
+      capturingHostContext = false;
+    }
   }
 
   function workspaceFromLocation() {
@@ -634,6 +722,7 @@
     const payload = {
       theme: currentTheme(),
       projects,
+      sidebarThreads: readCodexSidebarThreads(projects),
       user: readCodexUser() ?? undefined,
       titlebarLeftInset: titlebarLeftInset(),
       sidebarCollapsed: nativeSidebarCollapsed(),
@@ -676,6 +765,10 @@
           projects: liveContext.projects.length > 0
             ? liveContext.projects
             : hostContextSnapshot.projects,
+          sidebarThreads: mergeSidebarThreads(
+            hostContextSnapshot.sidebarThreads,
+            liveContext.sidebarThreads,
+          ),
         }
       : liveContext;
     postToFrame({ type: "taskboard:host-context", payload });
@@ -1363,7 +1456,7 @@
     const threadRow = event.target?.closest?.("[data-app-action-sidebar-thread-id]");
     const clickedThreadId = normalizeThreadId(threadRow?.getAttribute?.("data-app-action-sidebar-thread-id"));
     if (clickedThreadId) lastNativeThreadId = clickedThreadId;
-    if (!active || !isNativePageNavigation(event.target)) return;
+    if (!active || capturingHostContext || !isNativePageNavigation(event.target)) return;
     closeTaskboard(false);
   }
 
@@ -1397,6 +1490,8 @@
         "data-theme",
         "data-color-theme",
         "data-app-action-sidebar-thread-active",
+        "data-app-action-sidebar-thread-pinned",
+        "data-app-action-sidebar-thread-title",
         "aria-label",
         "aria-current",
       ],

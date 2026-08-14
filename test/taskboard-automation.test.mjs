@@ -185,6 +185,7 @@ test("the stable name and generated prompt are project-scoped and encode the cla
   assert.match(prompt, /关键改动、验证结果、执行结果和剩余风险/);
   assert.match(prompt, /in_review/);
   assert.match(prompt, /已绑定.*branch.*worktree/);
+  assert.match(prompt, /WORKTREE_CONFLICT.*不要重试/);
 });
 
 test("the generated cron spec uses the selected whitelisted local Codex options", () => {

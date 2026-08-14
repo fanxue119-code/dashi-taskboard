@@ -11,18 +11,21 @@ const inspectorSource = await readFile(new URL("../web/src/components/WorkflowIn
 const pickerSource = await readFile(new URL("../web/src/components/WorkflowStepPicker.tsx", import.meta.url), "utf8");
 const catalogSource = await readFile(new URL("../web/src/components/workflowCatalog.ts", import.meta.url), "utf8");
 const workflowStoreSource = await readFile(new URL("../web/src/workflowStore.ts", import.meta.url), "utf8");
+const issueListSource = await readFile(new URL("../web/src/components/IssueListView.tsx", import.meta.url), "utf8");
 const databaseSource = await readFile(new URL("../server/database.mjs", import.meta.url), "utf8");
 const serverSource = await readFile(new URL("../server/app.mjs", import.meta.url), "utf8");
 const styles = await readFile(new URL("../web/src/components/workflow.css", import.meta.url), "utf8");
 const globalStyles = await readFile(new URL("../web/src/styles.css", import.meta.url), "utf8");
 
-test("the taskboard defaults to issues and exposes the current project views", () => {
-  assert.match(appSource, /type BoardView = "dashboard" \| "issues" \| "list" \| "gantt" \| "workflow"/);
+test("standalone defaults to issues while injected Codex exposes sessions with the project views", () => {
+  assert.match(appSource, /type BoardView = "sessions" \| "dashboard" \| "issues" \| "list" \| "gantt" \| "workflow"/);
   assert.match(
     appSource,
-    /function readProjectBoardView\(projectId: string\): BoardView \{\s*const view = [^;]+;\s*return [\s\S]*?\? view\s*: "issues";\s*\}/,
+    /function readProjectBoardView\(projectId: string, fallback: BoardView = "issues"\): BoardView \{[\s\S]*?\? view\s*: fallback;\s*\}/,
   );
-  assert.match(appSource, /useState<BoardView>\(\(\) => readProjectBoardView\(initialProjectId\)\)/);
+  assert.match(appSource, /const defaultBoardView: BoardView = embedded \? "sessions" : "issues"/);
+  assert.match(appSource, /readProjectBoardView\(initialProjectId, defaultBoardView\)/);
+  assert.match(appSource, />\s*会话\s*<\/button>/);
   assert.match(appSource, />\s*Dashboard\s*<\/button>/);
   assert.match(appSource, />\s*议题看板\s*<\/button>/);
   assert.match(appSource, />\s*列表视图\s*<\/button>/);
@@ -31,7 +34,7 @@ test("the taskboard defaults to issues and exposes the current project views", (
   assert.match(appSource, /onClick=\{\(\) => selectBoardView\("issues"\)\}/);
   assert.match(appSource, /const SHOW_WORKFLOW_BOARD_ENTRY = false/);
   assert.match(appSource, /SHOW_WORKFLOW_BOARD_ENTRY && \([\s\S]*?>\s*节点模式\s*<\/button>/);
-  assert.match(appSource, /function changeProject[\s\S]*?setBoardView\(readProjectBoardView\(projectId\)\)/);
+  assert.match(appSource, /function changeProject[\s\S]*?setBoardView\(readProjectBoardView\(projectId, defaultBoardView\)\)/);
   assert.doesNotMatch(appSource, /<span>活跃<\/span>|<span>积压事项<\/span>|所有议题|add-view/);
 });
 
@@ -52,6 +55,22 @@ test("secondary views lazy-load while issue controls remain isolated", () => {
   assert.match(styles, /\.workflow-board/);
   assert.match(globalStyles, /\.workflow-node/);
   assert.doesNotMatch(appSource, /workflow-board-placeholder|具体功能将在后续开发/);
+});
+
+test("global project loads an aggregate task view without changing task ownership", () => {
+  assert.match(appSource, /const taskProjectId = projectId === GLOBAL_PROJECT_ID \? undefined : projectId/);
+  assert.match(appSource, /listTasks\(taskProjectId, options\.signal\)/);
+  assert.match(appSource, /listArchivedTasks\(taskProjectId, options\.signal\)/);
+  assert.match(appSource, /selectedProjectId !== GLOBAL_PROJECT_ID && task\.projectId !== selectedProjectId/);
+  assert.match(apiSource, /if \(projectId\) params\.set\("projectId", projectId\)/);
+  assert.match(apiSource, /projectId: string \| null \| undefined/);
+});
+
+test("list view offers one-click expansion and collapse for status groups", () => {
+  assert.match(issueListSource, /const allExpanded = collapsed\.size === 0/);
+  assert.match(issueListSource, /全部展开/);
+  assert.match(issueListSource, /全部折叠/);
+  assert.match(globalStyles, /\.issue-list-expand-all/);
 });
 
 test("the workflow catalog retains the real trigger, capability, API, integration, planning and result steps", () => {

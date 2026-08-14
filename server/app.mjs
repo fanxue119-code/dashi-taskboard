@@ -11,7 +11,9 @@ import { promisify } from "node:util";
 
 import {
   DEFAULT_PROJECT_ID,
+  GLOBAL_TASK_TODO_BLOCKED_MESSAGE,
   TASK_STATUSES,
+  isGlobalTaskTodo,
   isTaskPriority,
   isTaskStatus,
 } from "../shared/domain.mjs";
@@ -496,6 +498,86 @@ function parseThreadId(value) {
   return stringField(value, "threadId", { required: true, maxLength: 256 });
 }
 
+function normalizeCodexThreadId(value, name = "threadId") {
+  const threadId = stringField(value, name, { required: true, maxLength: 256 })
+    .replace(/^(?:local|cloud):/i, "");
+  if (!threadId || threadId.includes("\0")) {
+    throw new ApiError(400, "INVALID_FIELD", `'${name}' is invalid`);
+  }
+  return threadId;
+}
+
+function parseCodexThreadSnapshot(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set(["threads"]));
+  if (!Array.isArray(body.threads) || body.threads.length > 500) {
+    throw new ApiError(400, "INVALID_FIELD", "'threads' must be an array with at most 500 items");
+  }
+  const seen = new Set();
+  return body.threads.flatMap((entry, index) => {
+    assertPlainObject(entry);
+    assertAllowedKeys(entry, new Set([
+      "threadId",
+      "title",
+      "codexProjectId",
+      "codexProjectName",
+      "kind",
+      "pinned",
+      "active",
+      "running",
+      "nativeUpdatedAt",
+    ]));
+    const threadId = normalizeCodexThreadId(entry.threadId, `threads[${index}].threadId`);
+    if (seen.has(threadId)) return [];
+    seen.add(threadId);
+    for (const field of ["pinned", "active", "running"]) {
+      if (typeof entry[field] !== "boolean") {
+        throw new ApiError(400, "INVALID_FIELD", `'threads[${index}].${field}' must be a boolean`);
+      }
+    }
+    const nativeUpdatedAt = stringField(
+      entry.nativeUpdatedAt ?? null,
+      `threads[${index}].nativeUpdatedAt`,
+      { nullable: true, maxLength: 64 },
+    );
+    if (nativeUpdatedAt && !Number.isFinite(Date.parse(nativeUpdatedAt))) {
+      throw new ApiError(400, "INVALID_FIELD", `'threads[${index}].nativeUpdatedAt' must be an ISO date`);
+    }
+    return [{
+      threadId,
+      title: stringField(entry.title, `threads[${index}].title`, { required: true, maxLength: 240 }),
+      codexProjectId: stringField(
+        entry.codexProjectId ?? null,
+        `threads[${index}].codexProjectId`,
+        { nullable: true, maxLength: 256 },
+      ),
+      codexProjectName: stringField(
+        entry.codexProjectName ?? null,
+        `threads[${index}].codexProjectName`,
+        { nullable: true, maxLength: 240 },
+      ),
+      kind: stringField(entry.kind ?? null, `threads[${index}].kind`, { nullable: true, maxLength: 64 }),
+      pinned: entry.pinned,
+      active: entry.active,
+      running: entry.running,
+      nativeUpdatedAt,
+    }];
+  });
+}
+
+function parseCodexThreadLink(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set(["taskId"]));
+  if (!("taskId" in body)) {
+    throw new ApiError(400, "INVALID_FIELD", "'taskId' is required");
+  }
+  return {
+    taskId: body.taskId === null
+      ? null
+      : stringField(body.taskId, "taskId", { required: true, maxLength: 256 }),
+  };
+}
+
 function requestHeader(request, name) {
   const value = request.headers[name];
   return Array.isArray(value) ? value[0] : value;
@@ -593,6 +675,9 @@ function parseTaskCreate(body) {
     dueDate: parseDueDate(body.dueDate ?? null),
     recurrence: parseRecurrence(body.recurrence ?? null),
   };
+  if (isGlobalTaskTodo(task.projectId, task.status)) {
+    throw new ApiError(400, "GLOBAL_TASK_TODO_BLOCKED", GLOBAL_TASK_TODO_BLOCKED_MESSAGE);
+  }
   if (task.recurrence && !task.dueDate) {
     throw new ApiError(400, "INVALID_FIELD", "A recurring issue requires 'dueDate'");
   }
@@ -1780,6 +1865,38 @@ export function createTaskboardServer(options = {}) {
           return sendJson(response, 200, { runtime: hostRuntime });
         }
         return methodNotAllowed(response, ["GET", "PUT"]);
+      }
+
+      if (pathname === "/api/local/codex-threads") {
+        assertNoQuery(url.searchParams, "/api/local/codex-threads");
+        if (request.method === "GET") {
+          return sendJson(response, 200, { threads: database.listCodexThreads() });
+        }
+        if (request.method === "PUT") {
+          const threads = database.upsertCodexThreads(
+            parseCodexThreadSnapshot(await readJson(request)),
+          );
+          return sendJson(response, 200, { threads });
+        }
+        return methodNotAllowed(response, ["GET", "PUT"]);
+      }
+
+      const codexThreadTaskRoute = pathname.match(
+        /^\/api\/local\/codex-threads\/([^/]+)\/task$/,
+      );
+      if (codexThreadTaskRoute) {
+        if (request.method !== "PUT") return methodNotAllowed(response, ["PUT"]);
+        assertNoQuery(url.searchParams, "PUT /api/local/codex-threads/:id/task");
+        const threadId = normalizeCodexThreadId(
+          decodeRouteSegment(codexThreadTaskRoute[1], "Thread id"),
+        );
+        const { taskId } = parseCodexThreadLink(await readJson(request));
+        const thread = database.linkCodexThread(threadId, taskId);
+        events.emit("codex.thread.task.updated", {
+          projectId: thread.taskProjectId,
+          thread,
+        });
+        return sendJson(response, 200, { thread });
       }
 
       if (pathname === "/api/local/cloud-session") {

@@ -8,6 +8,8 @@ import type {
   AiChatThreadSnapshot,
   Attachment,
   Comment,
+  CodexSidebarThread,
+  CodexThreadRecord,
   DevelopmentScan,
   HostContext,
   IssueRelationType,
@@ -153,6 +155,43 @@ export async function publishHostRuntime(context: HostContext): Promise<void> {
       threadTodoProgress: context.threadTodoProgress ?? null,
     }),
   });
+}
+
+export async function listCodexThreads(signal?: AbortSignal): Promise<CodexThreadRecord[]> {
+  const data = await request<{ threads: CodexThreadRecord[] }>(
+    "/api/local/codex-threads",
+    { signal },
+  );
+  return data.threads;
+}
+
+export async function syncCodexThreads(
+  threads: CodexSidebarThread[],
+  signal?: AbortSignal,
+): Promise<CodexThreadRecord[]> {
+  const data = await request<{ threads: CodexThreadRecord[] }>(
+    "/api/local/codex-threads",
+    {
+      method: "PUT",
+      body: JSON.stringify({ threads }),
+      signal,
+    },
+  );
+  return data.threads;
+}
+
+export async function linkCodexThreadToTask(
+  threadId: string,
+  taskId: string | null,
+): Promise<CodexThreadRecord> {
+  const data = await request<{ thread: CodexThreadRecord }>(
+    `/api/local/codex-threads/${encodeURIComponent(threadId)}/task`,
+    {
+      method: "PUT",
+      body: JSON.stringify({ taskId }),
+    },
+  );
+  return data.thread;
 }
 
 export async function getAiChatCatalog(
@@ -345,27 +384,28 @@ export async function listDevelopmentContexts(
 }
 
 async function listTasksByArchive(
-  projectId: string,
+  projectId: string | null | undefined,
   archived: "true" | "false",
   signal?: AbortSignal,
 ): Promise<Task[]> {
-  const params = new URLSearchParams({ projectId, archived });
+  const params = new URLSearchParams({ archived });
+  if (projectId) params.set("projectId", projectId);
   const data = await request<{ tasks: Task[] }>(`/api/tasks?${params}`, { signal });
   return data.tasks;
 }
 
-export function listTasks(projectId: string, signal?: AbortSignal): Promise<Task[]> {
+export function listTasks(projectId: string | null | undefined, signal?: AbortSignal): Promise<Task[]> {
   return listTasksByArchive(projectId, "false", signal);
 }
 
-export function listArchivedTasks(projectId: string, signal?: AbortSignal): Promise<Task[]> {
+export function listArchivedTasks(projectId: string | null | undefined, signal?: AbortSignal): Promise<Task[]> {
   return listTasksByArchive(projectId, "true", signal);
 }
 
 export async function createTask(projectId: string, draft: TaskDraft, threadId?: string): Promise<Task> {
   const data = await request<{ task: Task }>("/api/tasks", {
     method: "POST",
-    body: JSON.stringify({ projectId, ...draft, ...(threadId ? { threadId } : {}) }),
+    body: JSON.stringify({ ...draft, projectId, ...(threadId ? { threadId } : {}) }),
   });
   return data.task;
 }

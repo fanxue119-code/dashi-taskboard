@@ -260,6 +260,55 @@ test("PATCH moves an issue to an existing project and records the change", async
   assert.equal(stale.body.error.code, "VERSION_CONFLICT");
 });
 
+test("moving a cloud task clears its development context while preserving its identifier", async () => {
+  await createProject("context-move-cloud-source");
+  await createProject("context-move-cloud-target");
+  const sourceTask = await createTask(
+    "context-move-cloud-source",
+    "Cloud context source",
+    alice,
+    { developmentContext: { type: "branch", branch: "source-branch" } },
+  );
+  const moved = await cloud.request(`/api/tasks/${sourceTask.body.task.id}`, {
+    method: "PATCH",
+    actorName: alice,
+    json: {
+      version: sourceTask.body.task.version,
+      projectId: "context-move-cloud-target",
+    },
+  });
+
+  assert.equal(moved.response.status, 200, JSON.stringify(moved.body));
+  assert.equal(moved.body.task.identifier, sourceTask.body.task.identifier);
+  assert.equal(moved.body.task.projectId, "context-move-cloud-target");
+  assert.equal(moved.body.task.developmentContext, null);
+});
+
+test("global cloud tasks can be backlogged but cannot enter todo", async () => {
+  const created = await createTask("local", "Global cloud backlog", alice, { status: "backlog" });
+  assert.equal(created.response.status, 201);
+
+  const createTodo = await createTask("local", "Global cloud todo", alice, { status: "todo" });
+  assert.equal(createTodo.response.status, 400);
+  assert.equal(createTodo.body.error.code, "GLOBAL_TASK_TODO_BLOCKED");
+
+  const patchTodo = await cloud.request(`/api/tasks/${created.body.task.id}`, {
+    method: "PATCH",
+    actorName: alice,
+    json: { version: created.body.task.version, status: "todo" },
+  });
+  assert.equal(patchTodo.response.status, 400);
+  assert.equal(patchTodo.body.error.code, "GLOBAL_TASK_TODO_BLOCKED");
+
+  const moveTodo = await cloud.request(`/api/tasks/${created.body.task.id}/move`, {
+    method: "POST",
+    actorName: alice,
+    json: { version: created.body.task.version, status: "todo" },
+  });
+  assert.equal(moveTodo.response.status, 400);
+  assert.equal(moveTodo.body.error.code, "GLOBAL_TASK_TODO_BLOCKED");
+});
+
 test("PATCH rejects moving an issue that still has relations", async () => {
   await createProject("move-related-cloud-source");
   await createProject("move-related-cloud-target");

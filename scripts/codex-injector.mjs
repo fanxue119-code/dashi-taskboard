@@ -1020,10 +1020,6 @@ function enqueueQuotaPolicyMutation(record, rpc, { explicit = false } = {}) {
         },
       );
       if (result.stale) return result;
-      if (!explicit && result.operation === "list" && result.item?.status === "PAUSED") {
-        current.version += 1;
-        current.request = { ...current.request, enabledByUser: false };
-      }
       if (result.item?.id) {
         current.request = { ...current.request, automationId: result.item.id };
       }
@@ -1345,6 +1341,22 @@ async function registerInjectionSource(cdp, source) {
   return registration.identifier;
 }
 
+async function grantLoopbackNetworkPermission(cdp) {
+  // Chrome 151 blocks an opaque sandbox from reaching localhost unless the
+  // isolated launcher profile has an explicit loopback grant. Older Chromium
+  // builds use the legacy permission name, so keep the fallback local.
+  for (const name of ["loopback-network", "local-network-access"]) {
+    try {
+      await cdp.send("Browser.setPermission", {
+        permission: { name },
+        setting: "granted",
+      });
+      return name;
+    } catch (_) {}
+  }
+  return null;
+}
+
 async function injectTarget(
   runtime,
   target,
@@ -1356,6 +1368,7 @@ async function injectTarget(
   supervisor,
   attachExisting,
   startupToken,
+  allowLoopbackNetwork,
 ) {
   const cdp = await runtime.connect(target);
   let retained = false;
@@ -1367,6 +1380,12 @@ async function injectTarget(
     await cdp.send("Page.enable");
     await cdp.send("Page.setBypassCSP", { enabled: true });
     await cdp.send("Runtime.enable");
+    if (allowLoopbackNetwork) {
+      const permission = await grantLoopbackNetworkPermission(cdp);
+      if (!permission) {
+        console.warn("Unable to grant loopback network permission; embedded Taskboard may be blocked by Chrome");
+      }
+    }
     if (keepAlive) await hostBridge.install();
     if (keepAlive && attachExisting) {
       const currentStatus = await readInjectionStatus(cdp);
@@ -1468,6 +1487,7 @@ async function injectAll(
   supervisor,
   attachExisting,
   startupToken,
+  allowLoopbackNetwork = false,
 ) {
   const targets = await runtime.targets();
   if (targets.length === 0) {
@@ -1499,6 +1519,7 @@ async function injectAll(
       supervisor,
       attachExisting,
       startupToken,
+      allowLoopbackNetwork && firstTarget,
     );
     if (connection) injectedTargets.set(target.id, connection);
     results.push({ targetId: target.id, title: target.title, url: target.url, ...result });
@@ -1675,6 +1696,7 @@ async function main() {
         supervisor,
         options.attachExisting,
         options.startupToken,
+        options.launch,
       );
     } catch (error) {
       if (!options.watch) throw error;
@@ -1724,6 +1746,7 @@ async function main() {
           supervisor,
           options.attachExisting,
           options.startupToken,
+          options.launch,
         );
         if (results.length > 0) {
           openPending = false;

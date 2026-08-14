@@ -70,6 +70,7 @@ export function buildTaskboardAutomationPrompt(request) {
     "若因 version 陈旧发生版本冲突，重新运行 issue get 和 comment list；仅当仍为可认领 todo、未绑定其他会话、未归档且描述和最新评论未变化时，用最新 version 重试一次。若已被认领、状态或要求已变、已归档、服务或永久 API 错误，或重试仍失败，立即跳过该议题、退出并报告；不得抢占或循环重试。",
     "若首次 issue get 返回 threadId，议题已绑定原会话：不要在当前自动化会话认领；使用 Codex send_message_to_thread 向原会话发送继续处理指令，由原会话按上述协议判断和认领，然后结束当前自动化会话。若没有 threadId，则在当前自动化会话处理。",
     "若议题已绑定 branch 或 worktree，必须在该议题绑定的开发上下文执行，避免并行 Agent 修改同一工作目录。",
+    "若 issue move 或 update 返回 WORKTREE_CONFLICT，说明该 Worktree 已被其他未结束议题占用；不要重试或改动目录，记录占用任务并结束本轮。",
     "执行完成并验证后，先用 comment add 记录关键改动、验证结果、执行结果和剩余风险，再使用最新 version 将议题移动到 in_review；不要直接标记为 done。",
     `本次处理或交接后，再次运行 ${taskctlCommand} issue list --project ${request.taskboardProjectId} --status todo --json。若没有 todo，使用 Codex automation_update 将名为「${automationName}」的当前自动化设为 PAUSED，保留其他字段，避免后续创建空会话。`,
   ].join("\n");

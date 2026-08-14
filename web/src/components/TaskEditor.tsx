@@ -7,6 +7,7 @@ import {
   type ActorIdentity,
   type DevelopmentContext,
   type DevelopmentScan,
+  type Project,
   type Recurrence,
   type Task,
   type TaskDraft,
@@ -53,7 +54,14 @@ const RECURRENCE_UNITS: Record<Recurrence["unit"], string> = {
   year: "年",
 };
 
+const GLOBAL_TASK_TODO_BLOCKED_MESSAGE = "全局任务不能进入“待认领”，请先选择所属项目，或改为“待立项”。";
+
+function isGlobalTaskTodo(projectId: string, status: TaskStatus): boolean {
+  return projectId === "local" && status === "todo";
+}
+
 export interface NewTaskEditorDraft {
+  projectId: string;
   title: string;
   descriptionSegments: InlineMediaSegment[];
   status: TaskStatus;
@@ -71,6 +79,8 @@ interface TaskEditorProps {
   task: Task | null;
   initialStatus: TaskStatus;
   initialDraft: NewTaskEditorDraft | null;
+  initialProjectId: string;
+  projects: Project[];
   labels: string[];
   currentUser: ActorIdentity;
   developmentScan: DevelopmentScan;
@@ -120,6 +130,8 @@ export function TaskEditor({
   task,
   initialStatus,
   initialDraft,
+  initialProjectId,
+  projects,
   labels: availableLabels,
   currentUser,
   developmentScan,
@@ -134,6 +146,7 @@ export function TaskEditor({
   const createSubmitIntentRef = useRef(false);
   const attachmentInputRef = useRef<HTMLInputElement>(null);
   const [title, setTitle] = useState(task?.title ?? initialDraft?.title ?? "");
+  const [projectId, setProjectId] = useState(task?.projectId ?? initialDraft?.projectId ?? initialProjectId);
   const [description, setDescription] = useState(task?.description ?? "");
   const [descriptionSegments, setDescriptionSegments] = useState<InlineMediaSegment[]>(
     () => initialDraft?.descriptionSegments ?? createInlineMediaSegments(),
@@ -191,6 +204,10 @@ export function TaskEditor({
       setError("重复议题需要先设置最早截止日期。");
       return;
     }
+    if (isGlobalTaskTodo(projectId, status)) {
+      setError(GLOBAL_TASK_TODO_BLOCKED_MESSAGE);
+      return;
+    }
 
     setSaving(true);
     setError(null);
@@ -202,6 +219,7 @@ export function TaskEditor({
         ? description.trim()
         : serializeInlineMedia(descriptionSegments).trim();
       await onSave({
+        projectId,
         title: cleanTitle,
         description: descriptionValue,
         status,
@@ -259,6 +277,7 @@ export function TaskEditor({
 
   function cancelEditor() {
     onCancel(task ? null : {
+      projectId,
       title,
       descriptionSegments,
       status,
@@ -353,6 +372,27 @@ export function TaskEditor({
 
         <div className="task-form-dock">
           <div className="property-row">
+            <label className="property-control property-project">
+              <LinearIcon name="project" />
+              <span className="sr-only">所属项目</span>
+              <select
+                aria-label="所属项目"
+                value={projectId}
+                onChange={(event) => {
+                  const nextProjectId = event.target.value;
+                  setProjectId(nextProjectId);
+                  if (nextProjectId !== projectId && nextProjectId !== task?.projectId) {
+                    setDevelopmentContext(null);
+                  }
+                }}
+              >
+                {projects.map((project) => (
+                  <option value={project.id} key={project.id}>
+                    {project.id === "local" ? "全局（暂未归类）" : project.name}
+                  </option>
+                ))}
+              </select>
+            </label>
             <TaskPropertyPicker
               value={status}
               options={TASK_STATUSES.map((value) => ({

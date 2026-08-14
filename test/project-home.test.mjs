@@ -75,11 +75,17 @@ test("the issue composer includes Linear-style labels and scheduling", () => {
   assert.match(editorSource, /developmentScan\.contexts/);
 });
 
-test("the current project is shown only in navigation, not in issue creation or detail properties", () => {
-  assert.doesNotMatch(editorSource, /property-project|dialog-project-icon|project\?\.name/);
-  assert.doesNotMatch(detailSource, /detail-property-label">项目|project-property-icon|project\.name/);
-  assert.doesNotMatch(styles, /\.property-project|\.dialog-project-icon|\.project-property-icon/);
-  assert.match(appSource, /createTaskRequest\(selectedProjectId, draft\)/);
+test("the current project can be selected in issue creation and detail properties", () => {
+  assert.match(editorSource, /className="property-control property-project"/);
+  assert.match(editorSource, /aria-label="所属项目"/);
+  assert.match(editorSource, /value=\{projectId\}/);
+  assert.match(detailSource, /className="detail-property-row project-property"/);
+  assert.match(detailSource, /aria-label="所属项目"/);
+  assert.match(detailSource, /saveTask\(\{ projectId: event\.target\.value \}, "projectId"\)/);
+  assert.match(appSource, /const targetProjectId = draft\.projectId \?\? selectedProjectId/);
+  assert.match(appSource, /createTaskRequest\(targetProjectId, draft\)/);
+  assert.match(appSource, /<TaskDetail[\s\S]*?projects=\{projects\}/);
+  assert.match(appSource, /<TaskEditor[\s\S]*?initialProjectId=\{selectedProjectId\}[\s\S]*?projects=\{projects\}/);
   assert.match(appSource, /className="header-project-switcher"/);
 });
 

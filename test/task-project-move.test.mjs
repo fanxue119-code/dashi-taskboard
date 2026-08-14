@@ -161,3 +161,53 @@ test("local combined project and status updates use the target status ordering",
     await fixture.close();
   }
 });
+
+test("global tasks may stay in backlog but cannot enter todo", async () => {
+  const fixture = await createFixture();
+  try {
+    const task = createTask(fixture.database, "local", "Global backlog", { status: "backlog" });
+
+    assert.throws(
+      () => fixture.database.updateTask(
+        task.id,
+        task.version,
+        { status: "todo" },
+        undefined,
+        actor,
+      ),
+      (error) => error?.status === 400 && error?.code === "GLOBAL_TASK_TODO_BLOCKED",
+    );
+    assert.throws(
+      () => fixture.database.moveTask(task.id, task.version, "todo", undefined, undefined, actor),
+      (error) => error?.status === 400 && error?.code === "GLOBAL_TASK_TODO_BLOCKED",
+    );
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("moving a task to another project preserves its identifier and clears development context", async () => {
+  const fixture = await createFixture();
+  try {
+    createProject(fixture.database, "context-move-source");
+    createProject(fixture.database, "context-move-target");
+    const task = createTask(fixture.database, "context-move-source", "Context source", {
+      status: "backlog",
+      developmentContext: { type: "branch", branch: "source-branch" },
+    });
+
+    const moved = fixture.database.updateTask(
+      task.id,
+      task.version,
+      { projectId: "context-move-target" },
+      undefined,
+      actor,
+    );
+
+    assert.equal(moved.identifier, task.identifier);
+    assert.equal(moved.projectId, "context-move-target");
+    assert.equal(moved.developmentContext, null);
+  } finally {
+    await fixture.close();
+  }
+});

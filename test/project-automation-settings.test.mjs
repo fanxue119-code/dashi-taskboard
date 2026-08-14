@@ -35,10 +35,10 @@ test("project automation state is device-local and scoped by taskboard project",
 
 test("automation requests use the exact Codex host message contract", () => {
   assert.match(appSource, /type: "taskboard:automation-request"/);
-  assert.match(appSource, /operation: "ensure-active" \| "pause" \| "list"/);
-  assert.match(appSource, /taskboardProjectId: selectedProjectId/);
+  assert.match(appSource, /operation: "ensure-active" \| "pause" \| "list" \| "apply-policy"/);
+  assert.match(appSource, /taskboardProjectId: projectId/);
   assert.match(appSource, /codexProjectId/);
-  assert.match(appSource, /projectName: selectedProject\.name/);
+  assert.match(appSource, /projectName: context\.projectName/);
   assert.match(appSource, /workspacePath/);
   assert.match(appSource, /skillPath: manageTaskboardSkillPath/);
   assert.match(appSource, /intervalMinutes: options\.intervalMinutes/);
@@ -51,7 +51,7 @@ test("automation requests use the exact Codex host message contract", () => {
 });
 
 test("project mapping is based on exact ids and workspace paths, never project names", () => {
-  assert.match(appSource, /hostContext\?\.projects\?\.some\([\s\S]*?project\.id === selectedProject\.id/);
+  assert.match(appSource, /hostContext\?\.projects\?\.find\([\s\S]*?candidate\.id === projectId/);
   assert.match(appSource, /deviceWorkspacePaths\[project\.id\] === workspacePath/);
   assert.match(appSource, /请先在 Codex 中添加并映射该项目目录/);
   assert.doesNotMatch(appSource, /project\.name === selectedProject\.name/);
@@ -63,6 +63,7 @@ test("the project navigation automation menu owns the icon, fields, and accessib
   assert.match(menuSource, /aria-busy=\{pending/);
   assert.match(menuSource, /自动认领/);
   assert.match(menuSource, /status === "ACTIVE" \? "自动认领中" : "自动化"/);
+  assert.match(menuSource, /status === "ACTIVE"\s*\? "运行中"\s*:\s*"等待新任务"/);
   assert.doesNotMatch(menuSource, /已开启自动认领|自动认领未开启/);
   assert.match(menuSource, /自动认领开关/);
   assert.match(menuSource, /5, 10, 15, 30, 60/);
@@ -155,12 +156,12 @@ test("opening settings and changing projects reconcile with the host list", () =
   );
   assert.match(
     reconcileSource,
-    /sendAutomationRequest\(\s*"list",\s*options,\s*stored\?\.automationId,\s*\)/,
+    /sendAutomationRequest\(\s*selectedProjectId,\s*"list",\s*options,\s*stored\?\.automationId,\s*\)/,
   );
   assert.doesNotMatch(reconcileSource, /"apply-policy"/);
   assert.match(
     saveSource,
-    /sendAutomationRequest\("apply-policy", options, stored\?\.automationId\)/,
+    /sendAutomationRequest\(\s*selectedProjectId,\s*"apply-policy",\s*options,\s*stored\?\.automationId,\s*\)/,
   );
   assert.match(appSource, /const policy = isAutomationHostPolicy\(response\.policy\) \? response\.policy : null/);
   assert.match(appSource, /const item = \(isAutomationHostItem\(response\.item\) \? response\.item : undefined\)\s*\?\? items\.find\(\(candidate\) => candidate\.id === policy\.automationId\)/);
@@ -172,4 +173,14 @@ test("opening settings and changing projects reconcile with the host list", () =
   assert.match(appSource, /quotaAware: policy\.quotaAware/);
   assert.match(appSource, /automationId: undefined,[\s\S]*?status: "PAUSED"/);
   assert.match(appSource, /writeProjectAutomation\(selectedProjectId, previousRecord\)/);
+});
+
+test("todo task saves wake the saved project automation without blocking the task", () => {
+  assert.match(appSource, /const resolveAutomationProjectContext = useCallback\(\(projectId: string\)/);
+  assert.match(appSource, /const wakeAutomationForTodo = useCallback/);
+  assert.match(appSource, /if \(saved\.status !== "todo" \|\| saved\.projectId === GLOBAL_PROJECT_ID\) return/);
+  assert.match(appSource, /if \(!stored\?\.enabledByUser \|\| stored\.status === "ACTIVE"\) return/);
+  assert.match(appSource, /sendAutomationRequest\(\s*saved\.projectId,\s*"apply-policy"/);
+  assert.equal(appSource.match(/void wakeAutomationForTodo\(/g)?.length, 3);
+  assert.match(appSource, /已保存，但目标项目自动认领唤醒失败/);
 });

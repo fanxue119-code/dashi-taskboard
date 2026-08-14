@@ -300,6 +300,7 @@ export interface HostContext {
   projects?: Array<{ id: string; name: string }>;
   titlebarLeftInset?: number;
   sidebarCollapsed?: boolean;
+  sidebarThreads?: CodexSidebarThread[];
   threadRunning?: boolean;
   threadTodoProgress?: {
     completed: number;
@@ -307,7 +308,29 @@ export interface HostContext {
   };
 }
 
+export interface CodexSidebarThread {
+  threadId: string;
+  title: string;
+  codexProjectId: string | null;
+  codexProjectName: string | null;
+  kind: string | null;
+  pinned: boolean;
+  active: boolean;
+  running: boolean;
+  nativeUpdatedAt: string | null;
+}
+
+export interface CodexThreadRecord extends CodexSidebarThread {
+  taskId: string | null;
+  taskProjectId: string | null;
+  taskIdentifier: string | null;
+  taskTitle: string | null;
+  linkedAt: string | null;
+  observedAt: string;
+}
+
 export interface TaskDraft {
+  projectId?: string;
   title: string;
   description: string;
   status: TaskStatus;

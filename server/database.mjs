@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { DEFAULT_PROJECT_ID, GLOBAL_TASK_TODO_BLOCKED_MESSAGE } from "../shared/domain.mjs";
 
 export class ApiError extends Error {
   constructor(status, code, message, details) {
@@ -15,6 +16,23 @@ export class ApiError extends Error {
 
 function now() {
   return new Date().toISOString();
+}
+
+const WORKTREE_OCCUPIED_STATUSES = new Set(["in_progress", "in_review", "blocked"]);
+
+function assertTaskStatusAllowedForProject(projectId, status) {
+  if (projectId === DEFAULT_PROJECT_ID && status === "todo") {
+    throw new ApiError(400, "GLOBAL_TASK_TODO_BLOCKED", GLOBAL_TASK_TODO_BLOCKED_MESSAGE);
+  }
+}
+
+function normalizedWorktreePath(value) {
+  if (typeof value !== "string" || value.trim() === "") return null;
+  return path.normalize(path.resolve(value));
+}
+
+function worktreePathForContext(context) {
+  return context?.type === "worktree" ? context.path : null;
 }
 
 function commentConversationTitle(body) {
@@ -254,6 +272,26 @@ function projectFromRow(row) {
   };
 }
 
+function codexThreadFromRow(row) {
+  return {
+    threadId: row.thread_id,
+    title: row.title,
+    codexProjectId: row.codex_project_id,
+    codexProjectName: row.codex_project_name,
+    kind: row.thread_kind,
+    pinned: row.pinned === 1,
+    active: row.active === 1,
+    running: row.running === 1,
+    nativeUpdatedAt: row.native_updated_at,
+    taskId: row.task_id,
+    taskProjectId: row.task_project_id ?? null,
+    taskIdentifier: row.task_identifier ?? null,
+    taskTitle: row.task_title ?? null,
+    linkedAt: row.linked_at,
+    observedAt: row.observed_at,
+  };
+}
+
 function projectSummaryFromRow(row) {
   return {
     projectId: row.project_id,
@@ -383,6 +421,24 @@ export class TaskboardDatabase {
 
       CREATE INDEX IF NOT EXISTS tasks_project_status_sort
         ON tasks(project_id, archived_at, status, sort_order, created_at);
+
+      CREATE TABLE IF NOT EXISTS codex_threads (
+        thread_id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        codex_project_id TEXT,
+        codex_project_name TEXT,
+        thread_kind TEXT,
+        pinned INTEGER NOT NULL DEFAULT 0 CHECK (pinned IN (0, 1)),
+        active INTEGER NOT NULL DEFAULT 0 CHECK (active IN (0, 1)),
+        running INTEGER NOT NULL DEFAULT 0 CHECK (running IN (0, 1)),
+        native_updated_at TEXT,
+        task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+        linked_at TEXT,
+        observed_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS codex_threads_task
+        ON codex_threads(task_id, observed_at DESC, thread_id);
 
       CREATE TABLE IF NOT EXISTS comments (
         id TEXT PRIMARY KEY,
@@ -828,6 +884,139 @@ export class TaskboardDatabase {
     return row ? projectFromRow(row) : null;
   }
 
+  listCodexThreads() {
+    return this.database.prepare(`
+      SELECT
+        codex_threads.thread_id,
+        codex_threads.title,
+        codex_threads.codex_project_id,
+        codex_threads.codex_project_name,
+        codex_threads.thread_kind,
+        codex_threads.pinned,
+        codex_threads.active,
+        codex_threads.running,
+        codex_threads.native_updated_at,
+        codex_threads.task_id,
+        tasks.project_id AS task_project_id,
+        tasks.identifier AS task_identifier,
+        tasks.title AS task_title,
+        codex_threads.linked_at,
+        codex_threads.observed_at
+      FROM codex_threads
+      LEFT JOIN tasks ON tasks.id = codex_threads.task_id
+      ORDER BY
+        CASE WHEN codex_threads.task_id IS NULL THEN 0 ELSE 1 END,
+        codex_threads.pinned DESC,
+        codex_threads.active DESC,
+        codex_threads.observed_at DESC,
+        codex_threads.thread_id
+    `).all().map(codexThreadFromRow);
+  }
+
+  upsertCodexThreads(entries) {
+    const timestamp = now();
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const statement = this.database.prepare(`
+        INSERT INTO codex_threads (
+          thread_id,
+          title,
+          codex_project_id,
+          codex_project_name,
+          thread_kind,
+          pinned,
+          active,
+          running,
+          native_updated_at,
+          observed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(thread_id) DO UPDATE SET
+          title = excluded.title,
+          codex_project_id = excluded.codex_project_id,
+          codex_project_name = excluded.codex_project_name,
+          thread_kind = excluded.thread_kind,
+          pinned = excluded.pinned,
+          active = excluded.active,
+          running = excluded.running,
+          native_updated_at = excluded.native_updated_at,
+          observed_at = excluded.observed_at
+      `);
+      for (const entry of entries) {
+        statement.run(
+          entry.threadId,
+          entry.title,
+          entry.codexProjectId,
+          entry.codexProjectName,
+          entry.kind,
+          entry.pinned ? 1 : 0,
+          entry.active ? 1 : 0,
+          entry.running ? 1 : 0,
+          entry.nativeUpdatedAt,
+          timestamp,
+        );
+      }
+      this.database.exec("COMMIT");
+      return this.listCodexThreads();
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  linkCodexThread(threadId, taskId) {
+    const current = this.database.prepare(
+      "SELECT thread_id, codex_project_id FROM codex_threads WHERE thread_id = ?",
+    ).get(threadId);
+    if (!current) {
+      throw new ApiError(404, "CODEX_THREAD_NOT_FOUND", `Codex thread '${threadId}' is not in the local inbox`);
+    }
+    if (taskId !== null) {
+      const task = this.database.prepare(
+        "SELECT id, project_id FROM tasks WHERE id = ?",
+      ).get(taskId);
+      if (!task) {
+        throw new ApiError(404, "TASK_NOT_FOUND", `Task '${taskId}' does not exist`);
+      }
+      const sourceProjectId = current.codex_project_id ?? "local";
+      if (task.project_id !== sourceProjectId) {
+        throw new ApiError(
+          409,
+          "CODEX_THREAD_PROJECT_MISMATCH",
+          "Codex thread and task must belong to the same project",
+          { codexProjectId: current.codex_project_id, taskProjectId: task.project_id },
+        );
+      }
+    }
+    const linkedAt = taskId === null ? null : now();
+    this.database.prepare(`
+      UPDATE codex_threads
+      SET task_id = ?, linked_at = ?
+      WHERE thread_id = ?
+    `).run(taskId, linkedAt, threadId);
+    const row = this.database.prepare(`
+      SELECT
+        codex_threads.thread_id,
+        codex_threads.title,
+        codex_threads.codex_project_id,
+        codex_threads.codex_project_name,
+        codex_threads.thread_kind,
+        codex_threads.pinned,
+        codex_threads.active,
+        codex_threads.running,
+        codex_threads.native_updated_at,
+        codex_threads.task_id,
+        tasks.project_id AS task_project_id,
+        tasks.identifier AS task_identifier,
+        tasks.title AS task_title,
+        codex_threads.linked_at,
+        codex_threads.observed_at
+      FROM codex_threads
+      LEFT JOIN tasks ON tasks.id = codex_threads.task_id
+      WHERE codex_threads.thread_id = ?
+    `).get(threadId);
+    return codexThreadFromRow(row);
+  }
+
   getProjectSummary(projectId) {
     const row = this.database.prepare(`
       SELECT project_id, summary, generated_at, attempted_at, error
@@ -1262,6 +1451,7 @@ export class TaskboardDatabase {
   }
 
   createTask(input) {
+    assertTaskStatusAllowedForProject(input.projectId, input.status);
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const project = this.database.prepare(`
@@ -1282,6 +1472,13 @@ export class TaskboardDatabase {
         throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${input.projectId}' does not exist`);
       }
 
+      const id = randomUUID();
+      this.#assertWorktreeAvailable(
+        worktreePathForContext(input.developmentContext),
+        id,
+        input.status,
+      );
+
       const prefix = project.first_identifier
         ? project.first_identifier.replace(/-\d+$/, "")
         : projectPrefix(project.id);
@@ -1292,7 +1489,6 @@ export class TaskboardDatabase {
       `).get(prefix.length + 2, `${prefix}-[0-9]*`).number;
       const number = Math.max(project.next_task_number, maximum === null ? 1 : maximum + 1);
       const identifier = `${prefix}-${number}`;
-      const id = randomUUID();
       const timestamp = now();
       let sortOrder = input.sortOrder;
       if (sortOrder === undefined) {
@@ -1357,7 +1553,6 @@ export class TaskboardDatabase {
   updateTask(id, version, changes, threadId, actor) {
     const current = this.#requireTask(id);
     this.#requireVersion(current, version);
-    const activityChanges = taskFieldChanges(current, changes);
     const targetProject = Object.hasOwn(changes, "projectId")
       ? this.database.prepare("SELECT id, name, workspace_path FROM projects WHERE id = ?").get(changes.projectId)
       : null;
@@ -1387,11 +1582,22 @@ export class TaskboardDatabase {
         );
       }
     }
+    const effectiveChanges = projectChanged
+      ? { ...changes, developmentContext: null }
+      : changes;
+    const activityChanges = taskFieldChanges(current, effectiveChanges);
     const dueDate = Object.hasOwn(changes, "dueDate") ? changes.dueDate : current.dueDate;
     const recurrence = Object.hasOwn(changes, "recurrence") ? changes.recurrence : current.recurrence;
     if (recurrence && !dueDate) {
       throw new ApiError(400, "INVALID_FIELD", "A recurring issue requires a due date");
     }
+
+    const nextProjectId = effectiveChanges.projectId ?? current.projectId;
+    const nextStatus = effectiveChanges.status ?? current.status;
+    assertTaskStatusAllowedForProject(nextProjectId, nextStatus);
+    const nextWorktreePath = Object.hasOwn(effectiveChanges, "developmentContext")
+      ? worktreePathForContext(effectiveChanges.developmentContext)
+      : worktreePathForContext(current.developmentContext);
 
     const columns = {
       projectId: "project_id",
@@ -1406,7 +1612,7 @@ export class TaskboardDatabase {
     };
     const assignments = [];
     const values = [];
-    for (const [key, value] of Object.entries(changes)) {
+    for (const [key, value] of Object.entries(effectiveChanges)) {
       if (key === "developmentContext") {
         assignments.push("git_branch = ?", "worktree_path = ?", "worktree_branch = ?");
         values.push(
@@ -1434,13 +1640,13 @@ export class TaskboardDatabase {
       assignments.push(`${columns[key]} = ?`);
       values.push(key === "labels" ? JSON.stringify(value) : value);
     }
-    if (Object.hasOwn(changes, "status") && changes.status !== current.status) {
+    if (Object.hasOwn(effectiveChanges, "status") && effectiveChanges.status !== current.status) {
       const placementProjectId = projectChanged ? targetProject.id : current.projectId;
       const row = this.database.prepare(`
         SELECT MIN(sort_order) AS minimum
         FROM tasks
         WHERE project_id = ? AND status = ? AND archived_at IS NULL AND id != ?
-      `).get(placementProjectId, changes.status, current.id);
+      `).get(placementProjectId, effectiveChanges.status, current.id);
       assignments.push("sort_order = ?");
       values.push(row.minimum === null ? 1000 : row.minimum - 1000);
     }
@@ -1454,6 +1660,7 @@ export class TaskboardDatabase {
 
     this.database.exec("BEGIN IMMEDIATE");
     try {
+      this.#assertWorktreeAvailable(nextWorktreePath, current.id, nextStatus);
       const result = this.database.prepare(`
         UPDATE tasks SET ${assignments.join(", ")} WHERE id = ? AND version = ?
       `).run(...values);
@@ -1477,6 +1684,7 @@ export class TaskboardDatabase {
   moveTask(id, version, status, sortOrder, threadId, actor) {
     const current = this.#requireTask(id);
     this.#requireVersion(current, version);
+    assertTaskStatusAllowedForProject(current.projectId, status);
     if (current.archivedAt !== null) {
       throw new ApiError(409, "TASK_ARCHIVED", "Archived tasks cannot be moved");
     }
@@ -1499,6 +1707,11 @@ export class TaskboardDatabase {
     const timestamp = now();
     this.database.exec("BEGIN IMMEDIATE");
     try {
+      this.#assertWorktreeAvailable(
+        worktreePathForContext(current.developmentContext),
+        current.id,
+        status,
+      );
       const result = this.database.prepare(`
         UPDATE tasks
         SET status = ?, sort_order = ?, thread_id = COALESCE(?, thread_id), version = version + 1, updated_at = ?
@@ -2069,6 +2282,37 @@ export class TaskboardDatabase {
       throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
     }
     return task;
+  }
+
+  #assertWorktreeAvailable(worktreePath, taskId, status) {
+    const normalizedPath = normalizedWorktreePath(worktreePath);
+    if (!normalizedPath || !WORKTREE_OCCUPIED_STATUSES.has(status)) return;
+
+    const candidates = this.database.prepare(`
+      SELECT id, identifier, title, status, worktree_path
+      FROM tasks
+      WHERE id != ?
+        AND archived_at IS NULL
+        AND worktree_path IS NOT NULL
+        AND status IN ('in_progress', 'in_review', 'blocked')
+    `).all(taskId);
+    const conflict = candidates.find((candidate) => (
+      normalizedWorktreePath(candidate.worktree_path) === normalizedPath
+    ));
+    if (!conflict) return;
+
+    throw new ApiError(
+      409,
+      "WORKTREE_CONFLICT",
+      `Worktree is already occupied by ${conflict.identifier} (${conflict.title})`,
+      {
+        worktreePath: normalizedPath,
+        taskId: conflict.id,
+        identifier: conflict.identifier,
+        title: conflict.title,
+        status: conflict.status,
+      },
+    );
   }
 
   #requireComment(id) {

@@ -237,7 +237,20 @@ npm run codex:inject -- --port 9229 --open
 
 Codex 26.715.52143 的 renderer CSP 会阻止任意 HTTP iframe。启动器使用 CDP 绕过该 renderer 的 CSP，并等待隔离的 Taskboard iframe 实际加载。正式 App 每次启动使用新的随机 CDP 端口和服务身份令牌；本地开发命令中的固定 CDP 端口只用于受信任的本机开发环境。
 
+独立开发命令 `npm run codex` 只会给它新建的隔离 Codex profile 授予本机回环网络权限，让 opaque sandbox 中的本地 Taskboard 可以访问 `127.0.0.1`；连接已有 Codex 的注入模式不会修改已有 profile 的权限。
+
 “在对话中打开”会选择对应的原生 Codex 项目，并打开带任务标识的未发送原生 composer。任务实际处理后，`taskctl` 从 `CODEX_THREAD_ID` 记录会话。记录的会话可通过 Codex 原生路由打开。每个任务可绑定一个 Git 分支或 worktree。
+
+### 会话按任务整理（本地 V1）
+
+注入 Codex 后，“会话”视图读取当前侧栏已经加载的会话元数据，并允许把会话关联到现有任务。项目模型保持不变：一个 Taskboard 项目仍对应一个 `workspacePath`；任务属于项目，一个任务可以关联多个会话。
+
+- 有明确 Codex 项目 ID 的会话，只进入同 ID 项目的候选列表；无项目范围或置顶区无法确认来源的会话，只进入“全局”候选，不猜归属。
+- 只读取侧栏可见的会话 ID、标题、来源项目、置顶、当前和运行状态；不读取会话正文。侧栏没有可靠时间时不补造时间。
+- 关联关系直接保存为“会话 → 任务”，任务详情可回看并打开原 Codex 会话。一个会话在 V1 至多关联一个任务。
+- 独立 Web 没有 Codex HostContext 时，只显示已经保存的任务关联，不会把“未读取侧栏”误报成“没有会话”。
+
+此 V1 不增加业务项目、多仓项目或仓库复用映射，也不安装 Skill/App、不自动认领任务、不调度 Codex。实时会话收件箱和原生会话打开必须在注入的 Codex 窗口中使用。
 
 ## 配置
 

@@ -22,10 +22,12 @@ import { TASK_STATUSES } from "../types";
 import type {
   ActorIdentity,
   Attachment,
+  CodexThreadRecord,
   Comment,
   DevelopmentContext,
   DevelopmentScan,
   IssueRelationType,
+  Project,
   Recurrence,
   Task,
   TaskChangeActivity,
@@ -81,6 +83,8 @@ const PRIORITY_DETAILS: Record<TaskPriority, { label: string; bars: number }> = 
 interface TaskDetailProps {
   task: Task;
   tasks: Task[];
+  projects: Project[];
+  relatedCodexThreads: CodexThreadRecord[];
   currentUser: ActorIdentity;
   availableLabels: string[];
   developmentScan: DevelopmentScan;
@@ -292,6 +296,8 @@ function ConversationLink({
 export function TaskDetail({
   task,
   tasks,
+  projects,
+  relatedCodexThreads,
   currentUser,
   availableLabels,
   developmentScan,
@@ -799,6 +805,33 @@ export function TaskDetail({
                     {description ? <DescriptionDocument value={description} /> : "添加描述…"}
                   </div>
                 )}
+                {relatedCodexThreads.length > 0 && (
+                  <section className="issue-related-sessions" aria-labelledby="issue-related-sessions-heading">
+                    <header>
+                      <h2 id="issue-related-sessions-heading">相关会话</h2>
+                      <span>{relatedCodexThreads.length}</span>
+                    </header>
+                    <div>
+                      {relatedCodexThreads.map((thread) => (
+                        <button
+                          type="button"
+                          key={thread.threadId}
+                          onClick={() => onOpenThread(thread.threadId)}
+                        >
+                          <span>
+                            <strong>{thread.title}</strong>
+                            <small>{thread.codexProjectName ?? "未识别代码项目"}</small>
+                          </span>
+                          <span className="issue-related-session-state">
+                            {thread.active && <b>当前</b>}
+                            {thread.running && <b>运行中</b>}
+                            <LinearIcon name="openExternal" />
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  </section>
+                )}
                 {currentTask.threadId && (
                   <div className="issue-conversation-list" aria-label="处理此议题的对话">
                     <ConversationLink threadId={currentTask.threadId} onOpen={onOpenThread} />
@@ -1261,6 +1294,24 @@ export function TaskDetail({
                 }}
               />
             </div>
+            <label className="detail-property-row project-property">
+              <span className="detail-property-icon" aria-hidden="true">
+                <LinearIcon name="project" />
+              </span>
+              <span className="detail-property-label">所属项目</span>
+              <select
+                value={currentTask.projectId}
+                disabled={savingProperty === "projectId"}
+                aria-label="所属项目"
+                onChange={(event) => void saveTask({ projectId: event.target.value }, "projectId")}
+              >
+                {projects.map((project) => (
+                  <option value={project.id} key={project.id}>
+                    {project.id === "local" ? "全局（暂未归类）" : project.name}
+                  </option>
+                ))}
+              </select>
+            </label>
             <div className="detail-property-row labels-property">
               <span className="detail-property-icon" aria-hidden="true">
                 <LinearIcon name="label" />

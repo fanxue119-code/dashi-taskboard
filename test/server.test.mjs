@@ -1216,6 +1216,118 @@ test("project and task CRUD flow", async () => {
   assert.equal(restoredWebsiteProject.issueCount, 1);
 });
 
+test("Codex sidebar sessions persist on tasks and cannot cross project boundaries", async () => {
+  const baseUrl = await startServer();
+  for (const project of [
+    { id: "codex-alpha", name: "Alpha", workspacePath: "/work/alpha" },
+    { id: "codex-beta", name: "Beta", workspacePath: "/work/beta" },
+  ]) {
+    const created = await request(baseUrl, "/api/projects", { method: "POST", body: project });
+    assert.equal(created.response.status, 201);
+  }
+  const alphaTask = (await request(baseUrl, "/api/tasks", {
+    method: "POST",
+    body: { projectId: "codex-alpha", title: "Alpha task", status: "todo" },
+  })).body.task;
+  const betaTask = (await request(baseUrl, "/api/tasks", {
+    method: "POST",
+    body: { projectId: "codex-beta", title: "Beta task", status: "todo" },
+  })).body.task;
+  const globalTask = (await request(baseUrl, "/api/tasks", {
+    method: "POST",
+    body: { projectId: "local", title: "Global task", status: "backlog" },
+  })).body.task;
+
+  const snapshot = await request(baseUrl, "/api/local/codex-threads", {
+    method: "PUT",
+    body: {
+      threads: [
+        {
+          threadId: "local:thread-alpha-1",
+          title: "Alpha one",
+          codexProjectId: "codex-alpha",
+          codexProjectName: "Alpha",
+          kind: "local",
+          pinned: false,
+          active: true,
+          running: false,
+          nativeUpdatedAt: null,
+        },
+        {
+          threadId: "cloud:thread-alpha-2",
+          title: "Alpha two",
+          codexProjectId: "codex-alpha",
+          codexProjectName: "Alpha",
+          kind: "cloud",
+          pinned: true,
+          active: false,
+          running: true,
+          nativeUpdatedAt: "2026-08-11T09:30:00.000Z",
+        },
+        {
+          threadId: "local:thread-global",
+          title: "Pinned global",
+          codexProjectId: null,
+          codexProjectName: null,
+          kind: "local",
+          pinned: true,
+          active: false,
+          running: false,
+          nativeUpdatedAt: null,
+        },
+      ],
+    },
+  });
+  assert.equal(snapshot.response.status, 200);
+  assert.deepEqual(
+    new Set(snapshot.body.threads.map((thread) => thread.threadId)),
+    new Set(["thread-alpha-1", "thread-alpha-2", "thread-global"]),
+  );
+
+  for (const threadId of ["thread-alpha-1", "thread-alpha-2"]) {
+    const linked = await request(
+      baseUrl,
+      `/api/local/codex-threads/${encodeURIComponent(threadId)}/task`,
+      { method: "PUT", body: { taskId: alphaTask.id } },
+    );
+    assert.equal(linked.response.status, 200);
+    assert.equal(linked.body.thread.taskId, alphaTask.id);
+    assert.equal(linked.body.thread.taskProjectId, "codex-alpha");
+  }
+
+  const globalLinked = await request(
+    baseUrl,
+    "/api/local/codex-threads/local%3Athread-global/task",
+    { method: "PUT", body: { taskId: globalTask.id } },
+  );
+  assert.equal(globalLinked.response.status, 200);
+  assert.equal(globalLinked.body.thread.taskProjectId, "local");
+
+  const mismatch = await request(
+    baseUrl,
+    "/api/local/codex-threads/thread-alpha-1/task",
+    { method: "PUT", body: { taskId: betaTask.id } },
+  );
+  assert.equal(mismatch.response.status, 409);
+  assert.equal(mismatch.body.error.code, "CODEX_THREAD_PROJECT_MISMATCH");
+
+  const persisted = await request(baseUrl, "/api/local/codex-threads");
+  const alphaLinks = persisted.body.threads.filter((thread) => thread.taskId === alphaTask.id);
+  assert.equal(alphaLinks.length, 2);
+  assert.equal(alphaLinks.every((thread) => thread.taskTitle === "Alpha task"), true);
+  assert.equal(
+    persisted.body.threads.find((thread) => thread.threadId === "thread-alpha-1").taskId,
+    alphaTask.id,
+  );
+
+  const emptyTask = await request(
+    baseUrl,
+    "/api/local/codex-threads/thread-alpha-1/task",
+    { method: "PUT", body: { taskId: "" } },
+  );
+  assert.equal(emptyTask.response.status, 400);
+});
+
 test("moving a task updates its status and sort order", async () => {
   const baseUrl = await startServer();
   const createResult = await request(baseUrl, "/api/tasks", {
@@ -1280,7 +1392,7 @@ test("tasks can bind, change, and unbind one project workflow", async () => {
 
 test("issues support parent, sub-issue, blocking, and related issue relationships", async () => {
   const baseUrl = await startServer();
-  const createIssue = async (title, status = "todo", projectId = "local") => {
+  const createIssue = async (title, status = "backlog", projectId = "local") => {
     const result = await request(baseUrl, "/api/tasks", {
       method: "POST",
       body: { projectId, title, status },
@@ -1434,11 +1546,16 @@ test("issue relationship changes are broadcast in realtime", async () => {
 test("all task statuses are accepted, filtered, and listed in workflow order", async () => {
   const baseUrl = await startServer();
   const statuses = ["canceled", "done", "blocked", "in_review", "in_progress", "todo", "backlog"];
+  const project = await request(baseUrl, "/api/projects", {
+    method: "POST",
+    body: { id: "status-project", name: "Status project" },
+  });
+  assert.equal(project.response.status, 201);
 
   for (const status of statuses) {
     const createResult = await request(baseUrl, "/api/tasks", {
       method: "POST",
-      body: { title: status, status },
+      body: { projectId: "status-project", title: status, status },
     });
     assert.equal(createResult.response.status, 201);
     assert.equal(createResult.body.task.status, status);
@@ -1958,6 +2075,36 @@ test("request boundaries reject unknown fields and invalid values", async () => 
   });
   assert.equal(invalidWorktree.response.status, 400);
   assert.equal(invalidWorktree.body.error.code, "INVALID_FIELD");
+});
+
+test("global tasks can be backlogged but cannot enter todo through the API", async () => {
+  const baseUrl = await startServer();
+  const created = await request(baseUrl, "/api/tasks", {
+    method: "POST",
+    body: { projectId: "local", title: "Global backlog", status: "backlog" },
+  });
+  assert.equal(created.response.status, 201);
+
+  const createTodo = await request(baseUrl, "/api/tasks", {
+    method: "POST",
+    body: { projectId: "local", title: "Global todo", status: "todo" },
+  });
+  assert.equal(createTodo.response.status, 400);
+  assert.equal(createTodo.body.error.code, "GLOBAL_TASK_TODO_BLOCKED");
+
+  const patchTodo = await request(baseUrl, `/api/tasks/${created.body.task.id}`, {
+    method: "PATCH",
+    body: { version: created.body.task.version, status: "todo" },
+  });
+  assert.equal(patchTodo.response.status, 400);
+  assert.equal(patchTodo.body.error.code, "GLOBAL_TASK_TODO_BLOCKED");
+
+  const moveTodo = await request(baseUrl, `/api/tasks/${created.body.task.id}/move`, {
+    method: "POST",
+    body: { version: created.body.task.version, status: "todo" },
+  });
+  assert.equal(moveTodo.response.status, 400);
+  assert.equal(moveTodo.body.error.code, "GLOBAL_TASK_TODO_BLOCKED");
 });
 
 test("task changes from one LAN client are broadcast to another client", async () => {

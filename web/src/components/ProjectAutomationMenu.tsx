@@ -83,7 +83,7 @@ export function ProjectAutomationMenu({
           ? "额度未知"
           : status === "ACTIVE"
             ? "运行中"
-            : "已暂停";
+            : "等待新任务";
   const disabled = pending || Boolean(unavailableReason);
 
   useEffect(() => {

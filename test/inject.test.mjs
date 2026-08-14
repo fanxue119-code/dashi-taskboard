@@ -10,10 +10,11 @@ const source = await readFile(sourceUrl, "utf8");
 const webStyles = await readFile(new URL("../web/src/styles.css", import.meta.url), "utf8");
 const webApp = await readFile(new URL("../web/src/App.tsx", import.meta.url), "utf8");
 const embeddedHost = await readFile(new URL("../web/src/embeddedHost.mjs", import.meta.url), "utf8");
+const injector = await readFile(new URL("../scripts/codex-injector.mjs", import.meta.url), "utf8");
 
 test("injection is an idempotent IIFE guarded by its current source hash", () => {
   assert.match(source, /^\(\(\) => \{/);
-  assert.match(source, /const VERSION = "0\.6\.13"/);
+  assert.match(source, /const VERSION = "0\.6\.14"/);
   assert.match(source, /const SOURCE_HASH = window\.__CODEX_TASKBOARD_SOURCE_HASH__/);
   assert.match(source, /const SENTINEL_KEY = "__codexTaskboardInjection__"/);
   assert.match(source, /previous\?\.sourceHash === SOURCE_HASH/);
@@ -33,6 +34,14 @@ test("embedded page uses the launcher URL inside an opaque sandbox", () => {
   assert.match(source, /taskboardOrigin = taskboardUrl\.origin/);
   assert.match(source, /frameOrigin = "null"/);
   assert.doesNotMatch(source, /allow-same-origin/);
+});
+
+test("only an independently launched Codex profile receives loopback permission", () => {
+  assert.match(injector, /async function grantLoopbackNetworkPermission\(cdp\)/);
+  assert.match(injector, /permission: \{ name \}/);
+  assert.match(injector, /\["loopback-network", "local-network-access"\]/);
+  assert.match(injector, /allowLoopbackNetwork && firstTarget/);
+  assert.match(injector, /options\.launch,\s*\n\s*\);/);
 });
 
 test("entry clones the native Plugins row and the page covers the complete Codex workspace", () => {
@@ -319,6 +328,29 @@ test("host context captures all Codex projects even when the sidebar section is 
   assert.match(source, /const threadId = currentThreadId \|\| lastNativeThreadId \|\| normalizeThreadId\(threadIdFromLocation\(\)\)/);
   assert.match(source, /replace\(\/\^\(\?:local\|cloud\):\/i, ""\)/);
   assert.match(source, /function findTasksSection\(\)/);
+});
+
+test("host context captures sidebar thread metadata without reading conversation bodies", () => {
+  const sidebarSource = source.slice(
+    source.indexOf("function readCodexSidebarThreads"),
+    source.indexOf("function findProjectsSection"),
+  );
+  assert.match(sidebarSource, /function readCodexSidebarThreads\(projects = readCodexProjects\(\)\)/);
+  assert.match(sidebarSource, /\[data-app-action-sidebar-thread-id\]/);
+  assert.match(sidebarSource, /data-app-action-sidebar-thread-title/);
+  assert.match(sidebarSource, /data-app-action-sidebar-project-list-id/);
+  assert.match(source, /function mergeSidebarThreads\(\.\.\.snapshots\)/);
+  assert.match(source, /data-app-action-sidebar-project-collapsed='true'/);
+  assert.match(source, /collapsedProjectIds\.forEach\(\(projectId\) => projectRowById\(projectId\)\?\.click/);
+  assert.match(source, /let capturingHostContext = false/);
+  assert.match(source, /capturingHostContext = true/);
+  assert.match(source, /capturingHostContext = false/);
+  assert.match(source, /capturingHostContext \|\| !isNativePageNavigation/);
+  assert.match(source, /sidebarThreads: mergeSidebarThreads\(/);
+  assert.match(sidebarSource, /data-app-action-sidebar-thread-pinned/);
+  assert.match(source, /sidebarThreads: readCodexSidebarThreads\(projects\)/);
+  assert.match(source, /replace\(\/\^\(\?:local\|cloud\):\/i, ""\)/);
+  assert.doesNotMatch(sidebarSource, /textContent|conversationBody|threadBody|messageHistory/);
 });
 
 test("cleanup removes observers, listeners, timers and owned DOM", () => {

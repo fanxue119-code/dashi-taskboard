@@ -1,4 +1,8 @@
 import { normalizeWorkflowSnapshot } from "../../shared/workflow-control-flow.mjs";
+import {
+  GLOBAL_TASK_TODO_BLOCKED_MESSAGE,
+  isGlobalTaskTodo,
+} from "../../shared/domain.mjs";
 
 const JSON_BODY_LIMIT = 1024 * 1024;
 const ATTACHMENT_BODY_LIMIT = 25 * 1024 * 1024;
@@ -953,6 +957,9 @@ function parseTaskCreate(body) {
     dueDate: parseDueDate(body.dueDate ?? null),
     recurrence: parseRecurrence(body.recurrence ?? null),
   };
+  if (isGlobalTaskTodo(input.projectId, input.status)) {
+    throw new ApiError(400, "GLOBAL_TASK_TODO_BLOCKED", GLOBAL_TASK_TODO_BLOCKED_MESSAGE);
+  }
   if (input.recurrence && !input.dueDate) {
     throw new ApiError(400, "INVALID_FIELD", "A recurring issue requires 'dueDate'");
   }
@@ -1329,6 +1336,9 @@ async function listTasks(env, filters) {
 }
 
 async function createTask(env, input, actor) {
+  if (isGlobalTaskTodo(input.projectId, input.status)) {
+    throw new ApiError(400, "GLOBAL_TASK_TODO_BLOCKED", GLOBAL_TASK_TODO_BLOCKED_MESSAGE);
+  }
   const project = await env.DB.prepare(`
     SELECT
       projects.id,
@@ -1463,12 +1473,21 @@ async function updateTask(env, id, input, actor) {
       );
     }
   }
+  const effectiveChanges = projectChanged
+    ? { ...input.changes, developmentContext: null }
+    : input.changes;
+  const nextProjectId = effectiveChanges.projectId ?? currentTask.projectId;
+  const nextStatus = effectiveChanges.status ?? currentTask.status;
+  if (isGlobalTaskTodo(nextProjectId, nextStatus)) {
+    throw new ApiError(400, "GLOBAL_TASK_TODO_BLOCKED", GLOBAL_TASK_TODO_BLOCKED_MESSAGE);
+  }
   const activityValues = { ...input.changes };
-  const dueDate = Object.hasOwn(input.changes, "dueDate")
-    ? input.changes.dueDate
+  if (projectChanged) activityValues.developmentContext = null;
+  const dueDate = Object.hasOwn(effectiveChanges, "dueDate")
+    ? effectiveChanges.dueDate
     : currentTask.dueDate;
-  const recurrence = Object.hasOwn(input.changes, "recurrence")
-    ? input.changes.recurrence
+  const recurrence = Object.hasOwn(effectiveChanges, "recurrence")
+    ? effectiveChanges.recurrence
     : currentTask.recurrence;
   if (recurrence && !dueDate) {
     throw new ApiError(400, "INVALID_FIELD", "A recurring issue requires a due date");
@@ -1487,7 +1506,7 @@ async function updateTask(env, id, input, actor) {
     startDate: "start_date",
     dueDate: "due_date",
   };
-  for (const [key, value] of Object.entries(input.changes)) {
+  for (const [key, value] of Object.entries(effectiveChanges)) {
     if (key === "developmentContext") {
       assignments.push("development_context_type = ?", "development_branch = ?");
       values.push(value?.type ?? null, value?.branch ?? null);
@@ -1499,15 +1518,15 @@ async function updateTask(env, id, input, actor) {
       values.push(key === "labels" ? JSON.stringify(value) : value);
     }
   }
-  const statusChanged = Object.hasOwn(input.changes, "status")
-    && input.changes.status !== currentTask.status;
+  const statusChanged = Object.hasOwn(effectiveChanges, "status")
+    && effectiveChanges.status !== currentTask.status;
   if (statusChanged) {
     const placementProjectId = projectChanged ? targetProject.id : currentTask.projectId;
     const row = await env.DB.prepare(`
       SELECT MIN(sort_order) AS minimum
       FROM tasks
       WHERE project_id = ? AND status = ? AND archived_at IS NULL AND id != ?
-    `).bind(placementProjectId, input.changes.status, current.id).first();
+    `).bind(placementProjectId, effectiveChanges.status, current.id).first();
     assignments.push("sort_order = ?");
     values.push(row?.minimum == null ? 1000 : row.minimum - 1000);
   }
@@ -1597,6 +1616,9 @@ async function updateTask(env, id, input, actor) {
 async function moveTask(env, id, input, actor) {
   const current = await requireTaskRow(env, id);
   assertTaskVersion(current, input.version);
+  if (isGlobalTaskTodo(current.project_id, input.status)) {
+    throw new ApiError(400, "GLOBAL_TASK_TODO_BLOCKED", GLOBAL_TASK_TODO_BLOCKED_MESSAGE);
+  }
   if (current.archived_at !== null) {
     throw new ApiError(409, "TASK_ARCHIVED", "Archived tasks cannot be moved");
   }
