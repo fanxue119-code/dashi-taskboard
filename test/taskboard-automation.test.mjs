@@ -177,10 +177,12 @@ test("the stable name and generated prompt are project-scoped and encode the cla
   assert.match(prompt, /ppt-skill/);
   assert.match(prompt, /\/Users\/example\/Documents\/ppt-skill/);
   assert.match(prompt, /每次仅处理一个 todo/);
+  assert.match(prompt, /STALE_RUNTIME_ENDPOINT.*INVALID_RUNTIME_DESCRIPTOR.*SERVICE_UNAVAILABLE/);
   assert.match(prompt, /issue get/);
   assert.match(prompt, /comment list/);
   assert.match(prompt, /最新 version/);
   assert.match(prompt, /in_progress/);
+  assert.match(prompt, /in_review.*返工.*当前会话.*in_progress/);
   assert.match(prompt, /版本冲突.*跳过/);
   assert.match(prompt, /关键改动、验证结果、执行结果和剩余风险/);
   assert.match(prompt, /in_review/);

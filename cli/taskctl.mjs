@@ -335,6 +335,21 @@ function createApiClient(overrides, { baseUrl: explicitBaseUrl } = {}) {
       const payload = await readResponse(response);
       if (!response.ok) {
         const apiError = extractApiError(payload, response.status);
+        if (
+          response.status === 404
+          && apiError.code === "NOT_FOUND"
+          && apiError.message === "Route not found"
+          && isScopedRuntimeUrl(baseUrl)
+        ) {
+          throw new TaskctlError(
+            "The Taskboard runtime endpoint is stale; refresh the active launcher before continuing",
+            {
+              code: "STALE_RUNTIME_ENDPOINT",
+              exitCode: 3,
+              details: `Runtime endpoint: ${baseUrl}`,
+            },
+          );
+        }
         throw new TaskctlError(apiError.message, {
           code: apiError.code,
           exitCode: response.status === 409 ? 5 : 4,
@@ -805,13 +820,30 @@ async function resolveTaskboardBaseUrl(env, overrides) {
       details: error instanceof Error ? error.message : String(error),
     });
   }
-  if (descriptor?.version !== 1 || typeof descriptor.url !== "string") {
+  if (
+    descriptor?.version !== 1
+    || typeof descriptor.url !== "string"
+    || !Number.isSafeInteger(descriptor.pid)
+    || descriptor.pid < 1
+  ) {
     throw new TaskctlError("The active Taskboard launcher endpoint is invalid", {
-      code: "INVALID_RESPONSE",
-      exitCode: 4,
+      code: "INVALID_RUNTIME_DESCRIPTOR",
+      exitCode: 3,
     });
   }
   return descriptor.url;
+}
+
+function isScopedRuntimeUrl(rawUrl) {
+  try {
+    const url = new URL(rawUrl);
+    return (
+      (url.hostname === "127.0.0.1" || url.hostname === "localhost")
+      && url.pathname.length > 1
+    );
+  } catch {
+    return false;
+  }
 }
 
 function resolveCompanionUrl(env) {

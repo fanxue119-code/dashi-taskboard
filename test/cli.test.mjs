@@ -76,6 +76,43 @@ test("CODEX_TASKBOARD_URL overrides the service origin", async () => {
   assert.equal(requestedUrl.toString(), "https://tasks.example.test/api/projects");
 });
 
+test("runtime descriptors require a launcher pid", async () => {
+  const result = await run(
+    ["project", "list", "--json"],
+    async () => {
+      throw new Error("fetch should not run for an invalid runtime descriptor");
+    },
+    {
+      env: { CODEX_TASKBOARD_RUNTIME_FILE: "/private/tmp/stale-taskboard-runtime.json" },
+      readFile: async () => JSON.stringify({
+        version: 1,
+        url: "http://127.0.0.1:47823/old-instance",
+      }),
+    },
+  );
+
+  assert.equal(result.exitCode, 3);
+  assert.equal(result.stderr.error.code, "INVALID_RUNTIME_DESCRIPTOR");
+});
+
+test("a scoped runtime Route not found is reported as a stale endpoint", async () => {
+  const result = await run(
+    ["project", "list", "--json"],
+    async () => response({ error: { code: "NOT_FOUND", message: "Route not found" } }, 404),
+    {
+      env: { CODEX_TASKBOARD_RUNTIME_FILE: "/private/tmp/stale-taskboard-runtime.json" },
+      readFile: async () => JSON.stringify({
+        version: 1,
+        pid: 12345,
+        url: "http://127.0.0.1:47823/old-instance",
+      }),
+    },
+  );
+
+  assert.equal(result.exitCode, 3);
+  assert.equal(result.stderr.error.code, "STALE_RUNTIME_ENDPOINT");
+});
+
 test("project create sends id, name, and an absolute workspace path", async () => {
   let requestBody;
   const result = await run(
