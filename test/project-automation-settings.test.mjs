@@ -27,27 +27,32 @@ test("project automation state is device-local and scoped by taskboard project",
   assert.match(appSource, /automationId\?: string/);
   assert.match(appSource, /codexProjectId: string/);
   assert.match(appSource, /type AutomationIntervalMinutes = 5 \| 10 \| 15 \| 30 \| 60/);
-  assert.match(appSource, /DEFAULT_AUTOMATION_OPTIONS[\s\S]*?model: "gpt-5\.5"[\s\S]*?reasoningEffort: "high"/);
+  assert.match(appSource, /DEFAULT_AUTOMATION_OPTIONS[\s\S]*?model: "gpt-5\.6-luna"[\s\S]*?reasoningEffort: "max"/);
   assert.match(appSource, /taskboardStorage\.getItem\(PROJECT_AUTOMATIONS_KEY\)/);
   assert.match(appSource, /taskboardStorage\.setItem\(PROJECT_AUTOMATIONS_KEY, JSON\.stringify\(next\)\)/);
   assert.match(appSource, /projectAutomations\[selectedProjectId\]/);
 });
 
-test("automation requests use the exact Codex host message contract", () => {
-  assert.match(appSource, /type: "taskboard:automation-request"/);
-  assert.match(appSource, /operation: "ensure-active" \| "pause" \| "list" \| "apply-policy"/);
-  assert.match(appSource, /taskboardProjectId: projectId/);
-  assert.match(appSource, /codexProjectId/);
-  assert.match(appSource, /projectName: context\.projectName/);
-  assert.match(appSource, /workspacePath/);
-  assert.match(appSource, /skillPath: manageTaskboardSkillPath/);
-  assert.match(appSource, /intervalMinutes: options\.intervalMinutes/);
-  assert.match(appSource, /model: options\.model/);
-  assert.match(appSource, /reasoningEffort: options\.reasoningEffort/);
-  assert.match(appSource, /message\.type === "taskboard:automation-response"/);
-  assert.match(appSource, /pendingAutomationRequestsRef/);
-  assert.match(appSource, /requestId/);
-  assert.match(appSource, /window\.setTimeout/);
+test("MVP automation stores a local project policy and pauses legacy cron before migration", () => {
+  const reconcileSource = appSource.slice(
+    appSource.indexOf("const reconcileProjectAutomation"),
+    appSource.indexOf("const saveProjectAutomation"),
+  );
+  const saveSource = appSource.slice(
+    appSource.indexOf("const saveProjectAutomation"),
+    appSource.indexOf("function openTaskDetail"),
+  );
+  assert.match(reconcileSource, /automationId: undefined/);
+  assert.match(reconcileSource, /quotaAware: false/);
+  assert.match(reconcileSource, /pauseLegacyAutomation\(selectedProjectId, stored\)/);
+  assert.match(saveSource, /writeProjectAutomation\(selectedProjectId/);
+  assert.match(saveSource, /automationId: undefined/);
+  assert.match(saveSource, /status: options\.enabledByUser \? "ACTIVE" : "PAUSED"/);
+  assert.match(saveSource, /stored\?\.automationId/);
+  assert.match(saveSource, /setAutomaticDispatchRevision/);
+  assert.match(appSource, /sendAutomationRequest\(\s*projectId,\s*"pause"/);
+  assert.match(appSource, /response\.item\.status !== "PAUSED"/);
+  assert.match(appSource, /保留原记录/);
 });
 
 test("project mapping is based on exact ids and workspace paths, never project names", () => {
@@ -66,7 +71,9 @@ test("the project navigation automation menu owns the icon, fields, and accessib
   assert.match(menuSource, /status === "ACTIVE"\s*\? "运行中"\s*:\s*"等待新任务"/);
   assert.doesNotMatch(menuSource, /已开启自动认领|自动认领未开启/);
   assert.match(menuSource, /自动认领开关/);
-  assert.match(menuSource, /5, 10, 15, 30, 60/);
+  assert.match(menuSource, /任务进入“待认领”后立即触发/);
+  assert.doesNotMatch(menuSource, /根据额度启用\/关闭/);
+  assert.doesNotMatch(menuSource, /<span>间隔<\/span>/);
   assert.match(menuSource, /AUTOMATION_MODELS\.map/);
   assert.match(menuSource, /EFFORT_LABELS\[effort\]/);
   assert.match(menuSource, /createPortal/);
@@ -95,8 +102,7 @@ test("the automation menu reuses the board switches and keeps form focus chrome 
   assert.match(menuSource, /className=\{`board-setting-switch\$\{draft\.enabledByUser \? " is-on" : ""\}`\}/);
   assert.match(menuSource, /role="switch"/);
   assert.match(menuSource, /aria-checked=\{draft\.enabledByUser\}/);
-  assert.match(menuSource, /className=\{`board-setting-switch\$\{draft\.quotaAware \? " is-on" : ""\}`\}/);
-  assert.match(menuSource, /aria-checked=\{draft\.quotaAware\}/);
+  assert.doesNotMatch(menuSource, /draft\.quotaAware \?/);
   assert.doesNotMatch(menuSource, /type="checkbox"/);
   assert.match(styles, /\.project-automation-field select:focus-visible\s*\{[^}]*outline:\s*0;[^}]*box-shadow:\s*none;/s);
   assert.doesNotMatch(styles, /\.project-automation-switch input:focus-visible/);
@@ -105,7 +111,7 @@ test("the automation menu reuses the board switches and keeps form focus chrome 
 test("unavailable automation state has one notice, clears stale errors, and cannot change", () => {
   assert.match(menuSource, /error && error !== unavailableReason/);
   assert.match(menuSource, /const disabled = pending \|\| Boolean\(unavailableReason\)/);
-  assert.equal(menuSource.match(/disabled=\{disabled\}/g)?.length, 5);
+  assert.equal(menuSource.match(/disabled=\{disabled\}/g)?.length, 3);
   const reconcileSource = appSource.slice(
     appSource.indexOf("const reconcileProjectAutomation"),
     appSource.indexOf("const saveProjectAutomation"),
@@ -145,7 +151,7 @@ test("pending completion reconciles the optimistic draft to confirmed host state
   assert.match(menuSource, /disabled=\{disabled\}/);
 });
 
-test("opening settings and changing projects reconcile with the host list", () => {
+test("opening settings and changing projects reconcile the local event-driven policy", () => {
   const reconcileSource = appSource.slice(
     appSource.indexOf("const reconcileProjectAutomation"),
     appSource.indexOf("const saveProjectAutomation"),
@@ -154,33 +160,27 @@ test("opening settings and changing projects reconcile with the host list", () =
     appSource.indexOf("const saveProjectAutomation"),
     appSource.indexOf("function openTaskDetail"),
   );
-  assert.match(
-    reconcileSource,
-    /sendAutomationRequest\(\s*selectedProjectId,\s*"list",\s*options,\s*stored\?\.automationId,\s*\)/,
-  );
-  assert.doesNotMatch(reconcileSource, /"apply-policy"/);
-  assert.match(
-    saveSource,
-    /sendAutomationRequest\(\s*selectedProjectId,\s*"apply-policy",\s*options,\s*stored\?\.automationId,\s*\)/,
-  );
-  assert.match(appSource, /const policy = isAutomationHostPolicy\(response\.policy\) \? response\.policy : null/);
-  assert.match(appSource, /const item = \(isAutomationHostItem\(response\.item\) \? response\.item : undefined\)\s*\?\? items\.find\(\(candidate\) => candidate\.id === policy\.automationId\)/);
-  assert.match(appSource, /items\.find\(\(candidate\) => candidate\.id === policy\.automationId\)/);
-  assert.match(appSource, /items\.length === 1 \? items\[0\] : undefined/);
-  assert.match(appSource, /automationId: item\?\.id \?\? policy\.automationId/);
-  assert.match(appSource, /status: item\?\.status \?\? "PAUSED"/);
-  assert.match(appSource, /enabledByUser: policy\.enabledByUser/);
-  assert.match(appSource, /quotaAware: policy\.quotaAware/);
-  assert.match(appSource, /automationId: undefined,[\s\S]*?status: "PAUSED"/);
-  assert.match(appSource, /writeProjectAutomation\(selectedProjectId, previousRecord\)/);
+  assert.match(reconcileSource, /writeProjectAutomation\(selectedProjectId, \{/);
+  assert.match(reconcileSource, /status: latest\.enabledByUser \? "ACTIVE" : "PAUSED"/);
+  assert.match(reconcileSource, /latest\.automationId !== stored\.automationId/);
+  assert.match(saveSource, /writeProjectAutomation\(selectedProjectId, \{/);
+  assert.match(saveSource, /quotaAware: false/);
+  assert.match(saveSource, /pauseLegacyAutomation\(selectedProjectId, stored\)/);
 });
 
-test("todo task saves wake the saved project automation without blocking the task", () => {
+test("todo tasks dispatch through local AI immediately and remain serialized", () => {
   assert.match(appSource, /const resolveAutomationProjectContext = useCallback\(\(projectId: string\)/);
-  assert.match(appSource, /const wakeAutomationForTodo = useCallback/);
-  assert.match(appSource, /if \(saved\.status !== "todo" \|\| saved\.projectId === GLOBAL_PROJECT_ID\) return/);
-  assert.match(appSource, /if \(!stored\?\.enabledByUser \|\| stored\.status === "ACTIVE"\) return/);
-  assert.match(appSource, /sendAutomationRequest\(\s*saved\.projectId,\s*"apply-policy"/);
-  assert.equal(appSource.match(/void wakeAutomationForTodo\(/g)?.length, 3);
-  assert.match(appSource, /已保存，但目标项目自动认领唤醒失败/);
+  assert.match(appSource, /const automaticDispatchesRef = useRef\(new Map<string, AutomaticDispatchEntry>\(\)\)/);
+  assert.match(appSource, /automaticTaskKey\(task\)/);
+  assert.match(appSource, /chooseAutomaticDispatch\(/);
+  assert.match(appSource, /if \(!localAiChatAvailable \|\| !aiChatThreadsHydrated\) return/);
+  assert.match(appSource, /recordAutomaticSkip\(skip\)/);
+  assert.match(appSource, /createAiChatThread\(\{[\s\S]*?issueId: task\.id/);
+  assert.match(appSource, /startAiChatTurn\(thread\.id/);
+  assert.match(appSource, /subscribeAiChatThread\(/);
+  assert.match(appSource, /自动认领不会接管已有会话/);
+  assert.match(appSource, /scheduleAutomaticDispatchRecovery\(/);
+  assert.match(appSource, /stopAutomaticDispatchMonitoring\(/);
+  assert.doesNotMatch(appSource, /const wakeAutomationForTodo/);
+  assert.equal(appSource.match(/void wakeAutomationForTodo\(/g)?.length ?? 0, 0);
 });

@@ -137,6 +137,8 @@ test("App wires the global panel outside project/detail branches and hides it wi
   assert.match(appSource, /<AiChat/);
   assert.match(appSource, /projectId=\{selectedProjectId \|\| null\}/);
   assert.match(appSource, /issueId=\{detailTaskId\}/);
+  assert.match(appSource, /refreshGeneration=\{aiChatRefreshGeneration\}/);
+  assert.match(appSource, /onThreadsChange=\{mergeAiChatThreads\}/);
   assert.match(appSource, /localAiChat/);
   assert.match(chatSource, /if \(!available\) return null/);
   assert.match(chatSource, /className="ai-chat-launcher/);
@@ -185,6 +187,15 @@ test("composer does not submit during IME composition and background runs keep l
   assert.match(chatSource, /backgroundRunningThreadIds/);
   assert.match(chatSource, /subscribeAiChatThread\(threadId/);
   assert.match(chatSource, /observedRunStatusesRef/);
+});
+
+test("App-owned automatic threads force AiChat to reload without losing the running snapshot", () => {
+  assert.match(chatSource, /refreshGeneration\?: number/);
+  assert.match(chatSource, /refreshGeneration = 0/);
+  assert.match(chatSource, /\[available, loadThreads, onThreadsHydrated, refreshGeneration\]/);
+  assert.match(appSource, /const mergeAiChatThreads = useCallback/);
+  assert.match(appSource, /new Map\(current\.map\(\(thread\) => \[thread\.id, thread\]\)\)/);
+  assert.match(appSource, /void updateAutomaticDispatchThread\(taskKey, thread\.id\)/);
 });
 
 test("submission stays disabled while a snapshot is loading", () => {

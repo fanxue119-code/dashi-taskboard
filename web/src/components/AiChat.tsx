@@ -69,6 +69,8 @@ interface AiChatProps {
   projectId: string | null;
   issueId: string | null;
   onThreadsChange?: (threads: AiChatThread[]) => void;
+  onThreadsHydrated?: (hydrated: boolean, threads: AiChatThread[]) => void;
+  refreshGeneration?: number;
   openThreadRequest?: AiChatOpenThreadRequest | null;
 }
 
@@ -962,6 +964,8 @@ export function AiChat({
   projectId,
   issueId,
   onThreadsChange,
+  onThreadsHydrated,
+  refreshGeneration = 0,
   openThreadRequest,
 }: AiChatProps) {
   const [panelOpen, setPanelOpen] = useState(false);
@@ -1195,7 +1199,7 @@ export function AiChat({
   );
   useEffect(() => () => selectedHintRefreshQueue.clear(), [selectedHintRefreshQueue]);
 
-  const loadThreads = useCallback(async () => {
+  const loadThreads = useCallback(async (): Promise<AiChatThread[] | null> => {
     try {
       const next = await listAiChatThreads();
       setThreads(next);
@@ -1206,8 +1210,10 @@ export function AiChat({
         selectedThreadRef.current = selected;
         return selected;
       });
+      return next;
     } catch (nextError) {
       setError(messageFor(nextError));
+      return null;
     }
   }, []);
 
@@ -1215,10 +1221,18 @@ export function AiChat({
     if (!available) {
       setPanelOpen(false);
       setThreads([]);
+      onThreadsHydrated?.(false, []);
       return;
     }
-    void loadThreads();
-  }, [available, loadThreads]);
+    let disposed = false;
+    onThreadsHydrated?.(false, []);
+    void loadThreads().then((next) => {
+      if (!disposed) onThreadsHydrated?.(next !== null, next ?? []);
+    });
+    return () => {
+      disposed = true;
+    };
+  }, [available, loadThreads, onThreadsHydrated, refreshGeneration]);
 
   useEffect(() => {
     onThreadsChange?.(available ? threads : []);

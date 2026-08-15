@@ -26,6 +26,8 @@ import {
   createTask as createTaskRequest,
   deleteArchivedTask as deleteArchivedTaskRequest,
   deleteProject as deleteProjectRequest,
+  createAiChatThread,
+  getAiChatThread,
   getCodexThreadProgress,
   getHostRuntime,
   getTaskboardRevision,
@@ -45,6 +47,8 @@ import {
   restoreTask as restoreTaskRequest,
   setCurrentUserActor,
   syncCodexThreads,
+  startAiChatTurn,
+  subscribeAiChatThread,
   uploadAttachment,
   updateTask as updateTaskRequest,
 } from "./api";
@@ -55,6 +59,13 @@ import {
 } from "./actors";
 import { BoardColumn, STATUS_DETAILS } from "./components/BoardColumn";
 import { AiChat, type AiChatOpenThreadRequest } from "./components/AiChat";
+import {
+  automaticTaskKey,
+  chooseAutomaticDispatch,
+  type AutomaticDispatchEntry,
+  type AutomaticDispatchPhase,
+  type AutomaticDispatchSkip,
+} from "./automaticDispatchState";
 import { CodexSessionInbox } from "./components/CodexSessionInbox";
 import { DashboardView } from "./components/DashboardView";
 import { IssueListView } from "./components/IssueListView";
@@ -252,8 +263,8 @@ const DEFAULT_AUTOMATION_OPTIONS = {
   enabledByUser: false,
   quotaAware: false,
   intervalMinutes: 5,
-  model: "gpt-5.5",
-  reasoningEffort: "high",
+  model: "gpt-5.6-luna",
+  reasoningEffort: "max",
 } as const;
 
 function readIssueActivityKeys(storageKey: string): Record<string, string> {
@@ -335,8 +346,8 @@ function readProjectAutomations(): ProjectAutomations {
     for (const [projectId, record] of Object.entries(value)) {
       if (!record || typeof record !== "object" || Array.isArray(record)) continue;
       const candidate = record as Partial<ProjectAutomationRecord>;
-      const model = candidate.model ?? "gpt-5.5";
-      const reasoningEffort = candidate.reasoningEffort ?? "high";
+      const model = candidate.model ?? "gpt-5.6-luna";
+      const reasoningEffort = candidate.reasoningEffort ?? "max";
       const enabledByUser = candidate.enabledByUser ?? candidate.status === "ACTIVE";
       const quotaAware = candidate.quotaAware ?? false;
       if (
@@ -347,7 +358,6 @@ function readProjectAutomations(): ProjectAutomations {
         || !isAutomationModel(model)
         || !isAutomationReasoningEffort(reasoningEffort)
         || !isSupportedModelEffort(model, reasoningEffort)
-        || (candidate.status === "ACTIVE" && !candidate.automationId)
         || typeof enabledByUser !== "boolean"
         || typeof quotaAware !== "boolean"
       ) continue;
@@ -518,7 +528,11 @@ function LocalRealtimeSync({
         // A malformed event should not interrupt later updates.
       }
       const affectsSelectedProject = Boolean(selectedProjectId)
-        && (!payload.projectId || payload.projectId === selectedProjectId);
+        && (
+          !payload.projectId
+          || selectedProjectId === GLOBAL_PROJECT_ID
+          || payload.projectId === selectedProjectId
+        );
       if (event.type === "project.created") {
         scheduleRefresh({ projects: true });
         return;
@@ -593,6 +607,9 @@ export function App() {
   const [taskboardMetadata, setTaskboardMetadata] = useState<TaskboardMetadata | null>(null);
   const [localAiChatAvailable, setLocalAiChatAvailable] = useState(false);
   const [aiThreads, setAiThreads] = useState<AiChatThread[]>([]);
+  const [aiChatThreadsHydrated, setAiChatThreadsHydrated] = useState(false);
+  const [aiChatRefreshGeneration, setAiChatRefreshGeneration] = useState(0);
+  const [automaticDispatchRevision, setAutomaticDispatchRevision] = useState(0);
   const [aiOpenThreadRequest, setAiOpenThreadRequest] = useState<AiChatOpenThreadRequest | null>(null);
   const [readActivityKeys, setReadActivityKeys] = useState<Record<string, string>>({});
   const [codexThreadProgress, setCodexThreadProgress] = useState<
@@ -681,6 +698,34 @@ export function App() {
   const pendingAutomationRequestsRef = useRef(new Map<string, PendingAutomationRequest>());
   const automationRequestInFlightRef = useRef(false);
   const projectAutomationsRef = useRef(projectAutomations);
+  const automaticDispatchesRef = useRef(new Map<string, AutomaticDispatchEntry>());
+  const automaticDispatchUnsubscribersRef = useRef(new Map<string, () => void>());
+  const automaticDispatchPollTimersRef = useRef(new Map<string, number>());
+  const legacyAutomationPauseRef = useRef(new Map<string, Promise<boolean>>());
+
+  const mergeAiChatThreads = useCallback((threads: AiChatThread[]) => {
+    setAiThreads((current) => {
+      const next = new Map(current.map((thread) => [thread.id, thread]));
+      for (const thread of threads) next.set(thread.id, thread);
+      for (const entry of automaticDispatchesRef.current.values()) {
+        if (entry.thread) next.set(entry.thread.id, entry.thread);
+      }
+      return [...next.values()].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+    });
+  }, []);
+
+  const handleAiChatThreadsHydrated = useCallback((hydrated: boolean, threads: AiChatThread[]) => {
+    if (hydrated) mergeAiChatThreads(threads);
+    setAiChatThreadsHydrated(hydrated);
+  }, [mergeAiChatThreads]);
+
+  const stopAutomaticDispatchMonitoring = useCallback((taskKey: string) => {
+    automaticDispatchUnsubscribersRef.current.get(taskKey)?.();
+    automaticDispatchUnsubscribersRef.current.delete(taskKey);
+    const timer = automaticDispatchPollTimersRef.current.get(taskKey);
+    if (timer !== undefined) window.clearTimeout(timer);
+    automaticDispatchPollTimersRef.current.delete(taskKey);
+  }, []);
 
   const setAnnouncement = useCallback((message: string) => {
     setUndoNotice(null);
@@ -954,94 +999,68 @@ export function App() {
     resolveAutomationProjectContext,
   ]);
 
+  const pauseLegacyAutomation = useCallback(async (
+    projectId: string,
+    stored: ProjectAutomationRecord,
+  ): Promise<boolean> => {
+    if (!stored.automationId) return true;
+    const existing = legacyAutomationPauseRef.current.get(projectId);
+    if (existing) return existing;
+
+    const request = (async () => {
+      setAutomationPending(true);
+      setAutomationError(null);
+      try {
+        const response = await sendAutomationRequest(
+          projectId,
+          "pause",
+          stored,
+          stored.automationId,
+        );
+        if (!response.item || response.item.status !== "PAUSED") {
+          throw new Error("旧自动化暂停未得到 Codex 的确认");
+        }
+        return true;
+      } catch (error) {
+        setAutomationError(
+          `旧自动化 ${stored.automationId} 尚未暂停，保留原记录：${errorMessage(error)}`,
+        );
+        return false;
+      } finally {
+        setAutomationPending(false);
+        legacyAutomationPauseRef.current.delete(projectId);
+      }
+    })();
+    legacyAutomationPauseRef.current.set(projectId, request);
+    return request;
+  }, [sendAutomationRequest]);
+
   const reconcileProjectAutomation = useCallback(async () => {
     if (automationProjectContext.unavailableReason) {
       setAutomationError(null);
       return;
     }
-    if (!selectedProjectId || !automationProjectContext.codexProjectId || automationRequestInFlightRef.current) return;
+    if (!selectedProjectId || !automationProjectContext.codexProjectId) return;
     const stored = projectAutomationsRef.current[selectedProjectId];
-    automationRequestInFlightRef.current = true;
-    setAutomationPending(true);
-    setAutomationError(null);
-    try {
-      const options = stored ?? {
-        status: "PAUSED" as const,
-        ...DEFAULT_AUTOMATION_OPTIONS,
-      };
-      const response = await sendAutomationRequest(
-        selectedProjectId,
-        "list",
-        options,
-        stored?.automationId,
-      );
-      const items = Array.isArray(response.items)
-        ? response.items.filter(isAutomationHostItem)
-        : [];
-      const policy = isAutomationHostPolicy(response.policy) ? response.policy : null;
-      if (!stored) {
-        if (!policy) return;
-        const item = (isAutomationHostItem(response.item) ? response.item : undefined)
-          ?? items.find((candidate) => candidate.id === policy.automationId)
-          ?? (items.length === 1 ? items[0] : undefined);
-        writeProjectAutomation(selectedProjectId, {
-          automationId: item?.id ?? policy.automationId,
-          codexProjectId: automationProjectContext.codexProjectId,
-          status: item?.status ?? "PAUSED",
-          enabledByUser: policy.enabledByUser,
-          quotaAware: policy.quotaAware,
-          ...(response.quota ? { quota: response.quota } : {}),
-          intervalMinutes: policy.intervalMinutes,
-          model: policy.model,
-          reasoningEffort: policy.reasoningEffort,
-        });
-        return;
-      }
-      const item = (isAutomationHostItem(response.item) ? response.item : undefined)
-        ?? items.find((item) => item.id === stored?.automationId)
-        ?? (items.length === 1 ? items[0] : undefined);
-      if (!item) {
-        if (stored) {
-          writeProjectAutomation(selectedProjectId, {
-            ...stored,
-            automationId: undefined,
-            status: "PAUSED",
-            enabledByUser: policy?.enabledByUser ?? stored.enabledByUser,
-            quotaAware: policy?.quotaAware ?? stored.quotaAware,
-            ...(response.quota ? { quota: response.quota } : {}),
-          });
-        }
-        return;
-      }
-      const intervalMinutes = intervalMinutesFromRrule(item.rrule);
-      if (!intervalMinutes) return;
-      writeProjectAutomation(selectedProjectId, {
-        automationId: item.id,
-        codexProjectId: automationProjectContext.codexProjectId,
-        status: item.status,
-        enabledByUser: policy?.enabledByUser ?? stored.enabledByUser,
-        quotaAware: policy?.quotaAware ?? stored.quotaAware,
-        ...(
-          response.quota
-            ? { quota: response.quota }
-            : stored.quota
-              ? { quota: stored.quota }
-              : {}
-        ),
-        intervalMinutes,
-        model: item.model,
-        reasoningEffort: item.reasoningEffort,
-      });
-    } catch (error) {
-      setAutomationError(error instanceof Error ? error.message : "无法读取自动化状态");
-    } finally {
-      automationRequestInFlightRef.current = false;
-      setAutomationPending(false);
-    }
+    if (!stored) return;
+    if (!(await pauseLegacyAutomation(selectedProjectId, stored))) return;
+    const latest = projectAutomationsRef.current[selectedProjectId] ?? stored;
+    if (latest.automationId !== stored.automationId) return;
+    // The MVP stores project automation locally. Legacy cron metadata is cleared only
+    // after the existing host bridge confirms that the old automation is paused.
+    writeProjectAutomation(selectedProjectId, {
+      ...latest,
+      automationId: undefined,
+      codexProjectId: automationProjectContext.codexProjectId,
+      status: latest.enabledByUser ? "ACTIVE" : "PAUSED",
+      quotaAware: false,
+      quota: undefined,
+      intervalMinutes: 5,
+    });
   }, [
     automationProjectContext,
+    pauseLegacyAutomation,
     selectedProjectId,
-    sendAutomationRequest,
     writeProjectAutomation,
   ]);
 
@@ -1052,87 +1071,29 @@ export function App() {
     model: AutomationModel;
     reasoningEffort: AutomationReasoningEffort;
   }) => {
-    const stored = projectAutomations[selectedProjectId];
     if (
       !selectedProjectId
       || automationProjectContext.unavailableReason
       || !automationProjectContext.codexProjectId
-      || automationRequestInFlightRef.current
     ) return;
-    const previousRecord = stored;
-    automationRequestInFlightRef.current = true;
-    setAutomationPending(true);
     setAutomationError(null);
-    try {
-      const response = await sendAutomationRequest(
-        selectedProjectId,
-        "apply-policy",
-        options,
-        stored?.automationId,
-      );
-      const item = isAutomationHostItem(response.item) ? response.item : undefined;
-      writeProjectAutomation(selectedProjectId, {
-        automationId: item?.id,
-        codexProjectId: automationProjectContext.codexProjectId,
-        status: item?.status ?? "PAUSED",
-        enabledByUser: options.enabledByUser,
-        quotaAware: options.quotaAware,
-        ...(response.quota ? { quota: response.quota } : {}),
-        intervalMinutes: options.intervalMinutes,
-        model: options.model,
-        reasoningEffort: options.reasoningEffort,
-      });
-    } catch (error) {
-      writeProjectAutomation(selectedProjectId, previousRecord);
-      setAutomationError(error instanceof Error ? error.message : "无法更新自动化");
-    } finally {
-      automationRequestInFlightRef.current = false;
-      setAutomationPending(false);
-    }
+    const stored = projectAutomationsRef.current[selectedProjectId];
+    if (stored?.automationId && !(await pauseLegacyAutomation(selectedProjectId, stored))) return;
+    writeProjectAutomation(selectedProjectId, {
+      automationId: undefined,
+      codexProjectId: automationProjectContext.codexProjectId,
+      status: options.enabledByUser ? "ACTIVE" : "PAUSED",
+      enabledByUser: options.enabledByUser,
+      quotaAware: false,
+      intervalMinutes: 5,
+      model: options.model,
+      reasoningEffort: options.reasoningEffort,
+    });
+    setAutomaticDispatchRevision((current) => current + 1);
   }, [
     automationProjectContext,
-    projectAutomations,
+    pauseLegacyAutomation,
     selectedProjectId,
-    sendAutomationRequest,
-    writeProjectAutomation,
-  ]);
-
-  const wakeAutomationForTodo = useCallback(async (
-    saved: Pick<Task, "identifier" | "projectId" | "status">,
-  ) => {
-    if (saved.status !== "todo" || saved.projectId === GLOBAL_PROJECT_ID) return;
-    const stored = projectAutomationsRef.current[saved.projectId];
-    if (!stored?.enabledByUser || stored.status === "ACTIVE") return;
-    const context = resolveAutomationProjectContext(saved.projectId);
-    if (context.unavailableReason || !context.codexProjectId) {
-      setActionError(
-        `${saved.identifier} 已保存，但目标项目自动认领未唤醒：${context.unavailableReason ?? "无法读取自动化信息"}`,
-      );
-      return;
-    }
-    try {
-      const response = await sendAutomationRequest(
-        saved.projectId,
-        "apply-policy",
-        stored,
-        stored.automationId,
-      );
-      const item = isAutomationHostItem(response.item) ? response.item : undefined;
-      writeProjectAutomation(saved.projectId, {
-        ...stored,
-        automationId: item?.id ?? stored.automationId,
-        codexProjectId: context.codexProjectId,
-        status: item?.status ?? stored.status,
-        ...(response.quota ? { quota: response.quota } : {}),
-      });
-    } catch (error) {
-      setActionError(
-        `${saved.identifier} 已保存，但目标项目自动认领唤醒失败：${errorMessage(error)}`,
-      );
-    }
-  }, [
-    resolveAutomationProjectContext,
-    sendAutomationRequest,
     writeProjectAutomation,
   ]);
 
@@ -1542,6 +1503,210 @@ export function App() {
     return () => controller.abort();
   }, [refreshTasks, selectedProjectId]);
 
+  const updateAutomaticDispatchThread = useCallback(async (taskKey: string, threadId: string) => {
+    const entry = automaticDispatchesRef.current.get(taskKey);
+    if (!entry || entry.thread?.id !== threadId || entry.phase === "starting") return;
+    try {
+      const snapshot = await getAiChatThread(threadId);
+      const currentRun = snapshot.thread.currentRun
+        ?? snapshot.runs.find((run) => run.status === "running")
+        ?? snapshot.runs.find((run) => run.id === entry.runId)
+        ?? null;
+      const phase: AutomaticDispatchPhase = currentRun?.status === "running"
+        ? "running"
+        : currentRun?.status === "failed" || snapshot.thread.status === "failed"
+          ? "failed"
+          : currentRun?.status === "completed" || currentRun?.status === "interrupted"
+            ? "completed"
+            : entry.phase;
+      const latestEntry = automaticDispatchesRef.current.get(taskKey);
+      if (!latestEntry || latestEntry.thread?.id !== threadId) return;
+      const alreadySettled = latestEntry.phase === "completed" || latestEntry.phase === "failed";
+      if (alreadySettled && phase === "running") return;
+      const settledPhase = alreadySettled ? latestEntry.phase : phase;
+      automaticDispatchesRef.current.set(taskKey, {
+        ...latestEntry,
+        phase: settledPhase,
+        thread: snapshot.thread,
+        runId: currentRun?.id ?? latestEntry.runId,
+        error: settledPhase === "failed" ? (currentRun?.error ?? "本地 AI 执行失败") : null,
+      });
+      mergeAiChatThreads([snapshot.thread]);
+      setAutomaticDispatchRevision((current) => current + 1);
+      if (settledPhase !== "running") {
+        stopAutomaticDispatchMonitoring(taskKey);
+      }
+    } catch (error) {
+      setActionError(`自动认领状态同步失败：${errorMessage(error)}。任务暂不自动派发下一个，请检查本地 Taskboard 服务。`);
+    }
+  }, [mergeAiChatThreads, stopAutomaticDispatchMonitoring]);
+
+  const scheduleAutomaticDispatchRecovery = useCallback((taskKey: string, threadId: string) => {
+    if (automaticDispatchPollTimersRef.current.has(taskKey)) return;
+    const timer = window.setTimeout(() => {
+      automaticDispatchPollTimersRef.current.delete(taskKey);
+      void updateAutomaticDispatchThread(taskKey, threadId).finally(() => {
+        const entry = automaticDispatchesRef.current.get(taskKey);
+        if (
+          entry?.thread?.id === threadId
+          && (entry.phase === "starting" || entry.phase === "running")
+        ) {
+          scheduleAutomaticDispatchRecovery(taskKey, threadId);
+        }
+      });
+    }, 3_000);
+    automaticDispatchPollTimersRef.current.set(taskKey, timer);
+  }, [updateAutomaticDispatchThread]);
+
+  const dispatchAutomaticTask = useCallback(async (
+    task: Task,
+    automation: ProjectAutomationRecord,
+  ) => {
+    const taskKey = automaticTaskKey(task);
+    if (automaticDispatchesRef.current.has(taskKey)) return;
+    const startingEntry: AutomaticDispatchEntry = {
+      taskId: task.id,
+      taskKey,
+      projectId: task.projectId,
+      phase: "starting",
+      thread: null,
+      runId: null,
+      error: null,
+    };
+    automaticDispatchesRef.current.set(taskKey, startingEntry);
+    setAutomaticDispatchRevision((current) => current + 1);
+
+    const context = resolveAutomationProjectContext(task.projectId);
+    if (context.unavailableReason || !context.codexProjectId) {
+      const error = context.unavailableReason ?? "目标项目尚未映射到本机工作区";
+      automaticDispatchesRef.current.set(taskKey, { ...startingEntry, phase: "failed", error });
+      setActionError(`${task.identifier} 自动认领未启动：${error}。任务仍保留在待认领。`);
+      setAutomaticDispatchRevision((current) => current + 1);
+      return;
+    }
+
+    try {
+      const thread = await createAiChatThread({
+        projectId: task.projectId,
+        issueId: task.id,
+        title: `自动认领 · ${task.identifier}`,
+        model: automation.model,
+        reasoningEffort: automation.reasoningEffort,
+        sandbox: "workspace-write",
+      });
+      automaticDispatchesRef.current.set(taskKey, { ...startingEntry, thread });
+      mergeAiChatThreads([thread]);
+      setAiChatRefreshGeneration((current) => current + 1);
+
+      const unsubscribe = subscribeAiChatThread(
+        thread.id,
+        () => void updateAutomaticDispatchThread(taskKey, thread.id),
+        () => setActionError(`${task.identifier} 的自动执行事件通道已断开，任务仍在执行状态，未自动重试。`),
+      );
+      automaticDispatchUnsubscribersRef.current.set(taskKey, unsubscribe);
+
+      const run = await startAiChatTurn(thread.id, {
+        message: [
+          `请处理 Taskboard 任务 ${task.identifier}（任务 ID：${task.id}）。这是项目 ${task.projectId} 的自动认领执行轮次。`,
+          "严格遵守 manage-taskboard 协议：先读取任务描述和最新评论；确认仍是 todo 且没有已绑定会话后，使用当前 Codex 会话原子移动到 in_progress，再开始任何业务工作。",
+          "按任务描述、评论和附件完成可验证的工作；完成后先评论改动、验证结果和剩余风险，再用最新版本移动到 in_review，不要直接标记 done。",
+          "如果信息不足、需要用户决定、Taskboard 入口失效或发现任务已有绑定会话，停止业务工作，评论说明原因并保留任务，不要接管、不要无限重试。",
+        ].join("\n"),
+      });
+      const runningThread: AiChatThread = {
+        ...thread,
+        status: "running",
+        currentRun: run,
+        latestTodo: null,
+      };
+      automaticDispatchesRef.current.set(taskKey, {
+        ...startingEntry,
+        phase: "running",
+        thread: runningThread,
+        runId: run.id,
+      });
+      mergeAiChatThreads([runningThread]);
+      setAiChatRefreshGeneration((current) => current + 1);
+      setAutomaticDispatchRevision((current) => current + 1);
+      void updateAutomaticDispatchThread(taskKey, thread.id);
+      scheduleAutomaticDispatchRecovery(taskKey, thread.id);
+    } catch (error) {
+      const message = errorMessage(error);
+      stopAutomaticDispatchMonitoring(taskKey);
+      const current = automaticDispatchesRef.current.get(taskKey) ?? startingEntry;
+      automaticDispatchesRef.current.set(taskKey, {
+        ...current,
+        phase: "failed",
+        error: message,
+      });
+      setActionError(`${task.identifier} 自动认领失败：${message}。任务仍保留在待认领，未自动重试。`);
+      setAutomaticDispatchRevision((currentRevision) => currentRevision + 1);
+    }
+  }, [
+    mergeAiChatThreads,
+    resolveAutomationProjectContext,
+    scheduleAutomaticDispatchRecovery,
+    stopAutomaticDispatchMonitoring,
+    updateAutomaticDispatchThread,
+  ]);
+
+  const recordAutomaticSkip = useCallback((skip: AutomaticDispatchSkip) => {
+    if (skip.reason === "failed-task-version" || automaticDispatchesRef.current.has(skip.taskKey)) return;
+    const message = skip.reason === "existing-local-thread"
+      ? `${skip.task.identifier} 已存在本地会话 ${skip.thread?.id ?? "未知"}，自动认领不重复创建。`
+      : `${skip.task.identifier} 已绑定会话 ${skip.task.threadId}，自动认领不会接管已有会话。`;
+    automaticDispatchesRef.current.set(skip.taskKey, {
+      taskId: skip.task.id,
+      taskKey: skip.taskKey,
+      projectId: skip.task.projectId,
+      phase: "failed",
+      thread: skip.thread ?? null,
+      runId: skip.thread?.currentRun?.id ?? null,
+      error: message,
+    });
+    setActionError(`${message} 任务仍保留在待认领，请在原会话中继续或处理后再重试。`);
+    setAutomaticDispatchRevision((current) => current + 1);
+  }, []);
+
+  useEffect(() => {
+    if (!localAiChatAvailable || !aiChatThreadsHydrated) return;
+    const projectIds = [...new Set(tasks
+      .map((task) => task.projectId)
+      .filter((projectId) => projectId !== GLOBAL_PROJECT_ID))];
+    for (const projectId of projectIds) {
+      const automation = projectAutomations[projectId];
+      if (!automation?.enabledByUser || automation.status !== "ACTIVE") continue;
+      const projectTasks = tasks.filter((task) => task.projectId === projectId);
+      const selection = chooseAutomaticDispatch({
+        projectId,
+        tasks: projectTasks,
+        aiThreads,
+        dispatches: automaticDispatchesRef.current.values(),
+        hydrated: aiChatThreadsHydrated,
+        automationId: automation.automationId,
+      });
+      for (const skip of selection.skipped) recordAutomaticSkip(skip);
+      if (selection.kind === "dispatch") void dispatchAutomaticTask(selection.task, automation);
+    }
+  }, [
+    aiThreads,
+    aiChatThreadsHydrated,
+    automaticDispatchRevision,
+    dispatchAutomaticTask,
+    localAiChatAvailable,
+    projectAutomations,
+    recordAutomaticSkip,
+    tasks,
+  ]);
+
+  useEffect(() => () => {
+    const taskKeys = new Set([
+      ...automaticDispatchUnsubscribersRef.current.keys(),
+      ...automaticDispatchPollTimersRef.current.keys(),
+    ]);
+    for (const taskKey of taskKeys) stopAutomaticDispatchMonitoring(taskKey);
+  }, [stopAutomaticDispatchMonitoring]);
+
   const refreshWorkflowOptions = useCallback(async (projectId: string, signal?: AbortSignal) => {
     const record = await getWorkflowWorkspace<unknown>(projectId, signal);
     if (!signal?.aborted) setWorkflowOptions(workflowOptionsFromWorkspace(record.workspace));
@@ -1880,7 +2045,6 @@ export function App() {
         ...current.filter((task) => task.id !== saved.id),
         ...(selectedProjectId === GLOBAL_PROJECT_ID || saved.projectId === selectedProjectId ? [saved] : []),
       ]));
-      void wakeAutomationForTodo(saved);
       if (creating) setNewTaskDraft(null);
       setEditor(null);
       if (failedAttachments > 0) {
@@ -1972,7 +2136,6 @@ export function App() {
       setTasks((current) => sortTasks(current.map((candidate) =>
         candidate.id === moved.id ? moved : candidate,
       )));
-      void wakeAutomationForTodo(moved);
       const message = task.status === status
         ? `${task.identifier} 排序已调整。`
         : `${task.identifier} 已移至${STATUS_DETAILS[status].label}。`;
@@ -2054,7 +2217,6 @@ export function App() {
       setTasks((current) => sortTasks(current.map((candidate) =>
         candidate.id === updated.id ? updated : candidate,
       )));
-      void wakeAutomationForTodo(updated);
       const previousAssigneeTarget = assigneeTargetForActor(previous.assignee, currentUser);
       if (!assigneeTarget || previousAssigneeTarget) {
         pushUndo(
@@ -3128,7 +3290,9 @@ export function App() {
         available={localAiChatAvailable}
         projectId={selectedProjectId || null}
         issueId={detailTaskId}
-        onThreadsChange={setAiThreads}
+        onThreadsChange={mergeAiChatThreads}
+        onThreadsHydrated={handleAiChatThreadsHydrated}
+        refreshGeneration={aiChatRefreshGeneration}
         openThreadRequest={aiOpenThreadRequest}
       />
 
