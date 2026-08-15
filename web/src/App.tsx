@@ -784,40 +784,38 @@ export function App() {
     if (!isLocalTaskboardOrigin(new URL(document.baseURI).origin)) {
       return { unavailableReason: "仅本地任务面板可用" };
     }
+    if (projectId === GLOBAL_PROJECT_ID) {
+      return { unavailableReason: "请切换到具体项目" };
+    }
     const project = projects.find((candidate) => candidate.id === projectId);
-    const codexProject = hostContext?.projects?.find((candidate) => candidate.id === projectId);
-    if (!project && !codexProject) return { unavailableReason: "请先选择项目" };
+    if (!project) return { unavailableReason: "请先选择具体项目" };
 
     const workspacePath = deviceWorkspacePaths[projectId]
       ?? project?.workspacePath
       ?? (
-        codexProject && hostContext?.projectId === projectId
+        hostContext?.projectId === projectId
           ? hostContext.workspacePath
           : undefined
       );
-    const codexProjectId = codexProject
-      ? projectId
-      : hostContext?.projects?.find(
-        (project) => deviceWorkspacePaths[project.id] === workspacePath,
-      )?.id;
 
-    if (!workspacePath || !codexProjectId) {
+    if (!workspacePath) {
       return { unavailableReason: "请先在 Codex 中添加并映射该项目目录" };
     }
-    if (!manageTaskboardSkillPath) {
-      return { unavailableReason: "任务面板还没有读取到 Skill 路径" };
-    }
+    const hostProjects = hostContext?.projects ?? [];
+    const currentHostProject = hostProjects.find((candidate) => candidate.id === hostContext?.projectId);
+    const codexProject = hostProjects.find((candidate) => candidate.id === projectId)
+      ?? hostProjects.find((candidate) => candidate.name === project.name)
+      ?? currentHostProject;
     return {
       workspacePath,
-      codexProjectId,
-      projectName: project?.name ?? codexProject?.name ?? projectId,
+      codexProjectId: codexProject?.id ?? hostContext?.projectId ?? projectId,
+      projectName: project.name,
       unavailableReason: null,
     };
   }, [
     deviceWorkspacePaths,
     embedded,
     hostContext,
-    manageTaskboardSkillPath,
     projects,
   ]);
   const automationProjectContext = useMemo(
@@ -957,13 +955,15 @@ export function App() {
   ) => {
     const context = resolveAutomationProjectContext(projectId);
     const project = projects.find((candidate) => candidate.id === projectId);
+    const legacyPause = Boolean(automationId);
     if (
       !project
-      || !context.codexProjectId
       || !context.workspacePath
+      || (legacyPause && !manageTaskboardSkillPath)
     ) {
       return Promise.reject(new Error(
-        context.unavailableReason ?? "无法读取项目自动化信息",
+        context.unavailableReason
+          ?? (legacyPause ? "任务面板还没有读取到 Skill 路径" : "无法读取项目自动化信息"),
       ));
     }
     const requestId = window.crypto.randomUUID();
@@ -1577,8 +1577,8 @@ export function App() {
     setAutomaticDispatchRevision((current) => current + 1);
 
     const context = resolveAutomationProjectContext(task.projectId);
-    if (context.unavailableReason || !context.codexProjectId) {
-      const error = context.unavailableReason ?? "目标项目尚未映射到本机工作区";
+    if (context.unavailableReason) {
+      const error = context.unavailableReason;
       automaticDispatchesRef.current.set(taskKey, { ...startingEntry, phase: "failed", error });
       setActionError(`${task.identifier} 自动认领未启动：${error}。任务仍保留在待认领。`);
       setAutomaticDispatchRevision((current) => current + 1);

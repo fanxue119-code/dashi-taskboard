@@ -55,11 +55,27 @@ test("MVP automation stores a local project policy and pauses legacy cron before
   assert.match(appSource, /保留原记录/);
 });
 
-test("project mapping is based on exact ids and workspace paths, never project names", () => {
-  assert.match(appSource, /hostContext\?\.projects\?\.find\([\s\S]*?candidate\.id === projectId/);
-  assert.match(appSource, /deviceWorkspacePaths\[project\.id\] === workspacePath/);
+test("local event automation only requires a concrete local project workspace", () => {
+  assert.match(appSource, /hostProjects\.find\([\s\S]*?candidate\.id === projectId/);
+  assert.match(appSource, /projectId === GLOBAL_PROJECT_ID[\s\S]*?请切换到具体项目/);
+  assert.match(appSource, /if \(!workspacePath\)[\s\S]*?请先在 Codex 中添加并映射该项目目录/);
+  assert.match(appSource, /candidate\.name === project\.name/);
+  assert.match(appSource, /hostContext\?\.projectId \?\? projectId/);
+  assert.doesNotMatch(
+    appSource.slice(
+      appSource.indexOf("const resolveAutomationProjectContext"),
+      appSource.indexOf("const automationProjectContext"),
+    ),
+    /manageTaskboardSkillPath|!codexProjectId/,
+  );
   assert.match(appSource, /请先在 Codex 中添加并映射该项目目录/);
-  assert.doesNotMatch(appSource, /project\.name === selectedProject\.name/);
+  assert.match(appSource, /const legacyPause = Boolean\(automationId\)/);
+  assert.match(appSource, /legacyPause && !manageTaskboardSkillPath/);
+  const dispatchSource = appSource.slice(
+    appSource.indexOf("const dispatchAutomaticTask"),
+    appSource.indexOf("const recordAutomaticSkip"),
+  );
+  assert.doesNotMatch(dispatchSource, /!context\.codexProjectId/);
 });
 
 test("the project navigation automation menu owns the icon, fields, and accessible popover", () => {
