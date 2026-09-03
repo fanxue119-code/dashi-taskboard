@@ -545,6 +545,53 @@ test("taskboard-managed native names are serialized and settle on the latest tas
   }
 });
 
+test("startup reconciliation backfills managed native thread titles", async () => {
+  const fixture = await createFixture();
+  try {
+    const task = fixture.database.createTask({
+      projectId: "project",
+      title: "西安流水核对",
+      description: "",
+      status: "in_progress",
+      priority: "none",
+      labels: [],
+      threadId: "codex-thread-existing",
+      actor: { type: "user", id: "local-user", name: "本地用户", avatarUrl: null },
+      assignee: { type: "user", id: "local-user", name: "本地用户", avatarUrl: null },
+      workflowId: null,
+      developmentContext: null,
+      startDate: null,
+      dueDate: null,
+      recurrence: null,
+    });
+    const thread = await fixture.service.createThread({
+      projectId: "project",
+      issueId: task.id,
+      taskboardManaged: true,
+      model: "gpt-real",
+      reasoningEffort: "high",
+      sandbox: "workspace-write",
+    });
+    fixture.database.updateAiChatThread(thread.id, {
+      title: "自动认领 · TEST-1",
+      codexThreadId: "codex-thread-existing",
+      taskboardAutoName: false,
+    });
+
+    await fixture.service.syncManagedThreadTitles();
+
+    assert.equal(fixture.service.getThread(thread.id).title, "Taskboard · 西安流水核对");
+    assert.equal(fixture.service.getThread(thread.id).taskboardAutoName, true);
+    assert.deepEqual(fixture.nativeNameCalls, [{
+      threadId: "codex-thread-existing",
+      name: "Taskboard · 西安流水核对",
+      cwd: fixture.workspace,
+    }]);
+  } finally {
+    await fixture.close();
+  }
+});
+
 test("a native sidebar rename releases management and resume preserves the custom name", async () => {
   const fixture = await createFixture();
   try {

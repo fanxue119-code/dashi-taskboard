@@ -80,9 +80,12 @@ test("passive automation policy keeps idle pauses and only resumes quota pauses"
 });
 
 test("the package injection command remains resident for tab-triggered recovery", () => {
+  assert.match(packageJson.scripts.codex, /--launch --daemon --open/);
   assert.match(packageJson.scripts["codex:inject"], /--watch/);
   assert.match(packageJson.scripts["codex:daemon"], /--daemon --open/);
   assert.match(source, /function startResidentInjector/);
+  assert.match(source, /function launchCodexDetached[\s\S]*\/usr\/bin\/open[\s\S]*detached: true/);
+  assert.match(source, /else if \(options\.launch\)[\s\S]*launchCodexDetached\(options\.appPath, port\)[\s\S]*startResidentInjector/);
   assert.match(source, /const defaultCodexDebuggingPort = 9229/);
   assert.match(source, /port: defaultCodexDebuggingPort/);
   assert.match(source, /--startup-token/);

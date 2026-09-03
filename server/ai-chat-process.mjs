@@ -238,6 +238,12 @@ export function buildCodexPrompt(
   if (thread.origin.issueIdentifier) {
     context.push(`issue_identifier: ${thread.origin.issueIdentifier}`);
   }
+  if (thread.taskboardManaged && thread.origin.issueId) {
+    context.push(
+      "taskboard_binding: this is the established primary execution thread for the issue above.",
+      "taskboard_offline_rule: if Taskboard becomes temporarily unavailable after this thread has been bound, continue only within the established issue scope, disclose that board synchronization is deferred, and sync comments/status after the entrypoint recovers. An unavailable entrypoint never authorizes claiming another issue or bypassing a binding conflict.",
+    );
+  }
   if (turnAttachmentPaths.length > 0) {
     context.push(
       "turn_attachment_paths:",

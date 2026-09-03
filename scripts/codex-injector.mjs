@@ -314,6 +314,29 @@ function launchCodex(appPath, port) {
   );
 }
 
+function launchCodexDetached(appPath, port) {
+  const child = spawn(
+    "/usr/bin/open",
+    [
+      "-n",
+      "-a",
+      appPath,
+      "--args",
+      `--user-data-dir=${independentCodexProfilePath}`,
+      "--remote-debugging-address=127.0.0.1",
+      `--remote-debugging-port=${port}`,
+      `--remote-allow-origins=http://127.0.0.1:${port}`,
+    ],
+    {
+      detached: true,
+      env: withoutTaskboardLauncherEnvironment(process.env),
+      stdio: "ignore",
+    },
+  );
+  child.unref();
+  return child;
+}
+
 async function launchCodexWithPipe(appPath) {
   const child = spawn(
     codexExecutablePath(appPath),
@@ -1553,19 +1576,33 @@ async function main() {
 
   if (options.daemon) {
     let port = options.port;
-    if (!options.portExplicit) {
+    let activePort = null;
+    if (!options.portExplicit || options.launch) {
       const candidates = codexDebuggingPorts(options.port);
-      const activePort = await Promise.any(candidates.map(async (candidate) => {
+      activePort = await Promise.any(candidates.map(async (candidate) => {
         if (!(await isReachable(`http://127.0.0.1:${candidate}/json/version`))) {
           throw new Error("unreachable");
         }
         if ((await codexTargets(candidate)).length === 0) throw new Error("not Codex");
         return candidate;
       })).catch(() => null);
-      if (!activePort) throw new Error("No debuggable Codex window found");
-      port = activePort;
     }
-    console.log(JSON.stringify({ launcher: startResidentInjector(port, options.open), port }, null, 2));
+    if (activePort) {
+      port = activePort;
+    } else if (options.launch) {
+      await importCodexBrowserProfile();
+      launchCodexDetached(options.appPath, port);
+      await waitUntilReachable(`http://127.0.0.1:${port}/json/version`, 30_000);
+    } else {
+      throw new Error("No debuggable Codex window found");
+    }
+    const launcher = startResidentInjector(
+      port,
+      options.open,
+      true,
+      options.startupToken,
+    );
+    console.log(JSON.stringify({ launcher, port }, null, 2));
     return;
   }
 

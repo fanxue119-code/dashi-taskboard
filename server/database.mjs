@@ -741,7 +741,7 @@ export class TaskboardDatabase {
     this.database.exec(`
       UPDATE ai_chat_threads AS thread
       SET taskboard_managed = 1,
-          taskboard_auto_name = 0
+          taskboard_auto_name = 1
       WHERE thread.taskboard_managed = 0
         AND thread.title LIKE '自动认领 · %'
         AND thread.origin_issue_id IS NOT NULL

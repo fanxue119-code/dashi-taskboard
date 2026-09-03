@@ -1599,6 +1599,7 @@ export function createTaskboardServer(options = {}) {
     resolveContext: resolveAiChatContext,
     onTaskChanged: (type, task) => events.emit(type, { task }),
   });
+  void aiChat.syncManagedThreadTitles();
   const projectSummary = new ProjectSummaryService({
     database,
     codexExecutable: resolved.codexExecutable,

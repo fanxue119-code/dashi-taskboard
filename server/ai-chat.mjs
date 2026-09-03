@@ -234,6 +234,37 @@ export class AiChatService {
     }
   }
 
+  async syncManagedThreadTitles() {
+    const pending = [];
+    for (const thread of this.database.listAiChatThreads()) {
+      const issueId = thread.origin.issueId;
+      const legacyAutomaticName = thread.title.startsWith("自动认领 · ");
+      if (
+        !issueId
+        || !thread.taskboardManaged
+        || (!thread.taskboardAutoName && !legacyAutomaticName)
+      ) continue;
+      const task = this.database.getTask(issueId);
+      if (
+        !task
+        || task.projectId !== thread.origin.projectId
+        || task.archivedAt != null
+      ) continue;
+      const updated = this.database.updateAiChatThread(thread.id, {
+        title: `Taskboard · ${task.title}`,
+        taskboardAutoName: true,
+      });
+      if (updated.codexThreadId) {
+        pending.push(this.#syncCodexThreadName(
+          updated,
+          updated.codexThreadId,
+          updated.currentRun?.id ?? null,
+        ));
+      }
+    }
+    await Promise.all(pending);
+  }
+
   async startTurn(threadId, input) {
     let thread = this.getThread(threadId);
     if (this.#threadIsActive(thread)) {
@@ -441,6 +472,7 @@ export class AiChatService {
         `Taskboard 任务 ${task.identifier} 收到了用户的新评论或附件（评论 ID：${commentId}）。`,
         "请先用 taskctl 重新读取任务、最新评论及该评论的全部附件，只处理这次新增要求，并复用当前主执行会话继续。",
         blockedInstructions,
+        "当前会话已经是本任务的主执行会话。若 Taskboard 在执行途中暂时不可用，不要因此停止本任务范围内的工作；明确告知用户状态同步已延后，并在入口恢复后再补写评论和状态。只有绑定冲突、任务范围不明确或高风险动作需要确认时才停止。",
         "完成可验证工作后评论结果；成功结束本轮时 Taskboard 会自动进入 in_review。不要创建或接管其他会话。",
       ].join("\n"),
     });
