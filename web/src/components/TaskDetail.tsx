@@ -14,6 +14,7 @@ import {
   listTaskActivities,
   markdownIncludesAttachment,
   resolvePersistedAttachmentUrl,
+  resumeTaskFromUpdate,
   uploadAttachment,
   uploadCommentAttachment,
   updateComment,
@@ -333,6 +334,7 @@ export function TaskDetail({
   const [taskActivities, setTaskActivities] = useState<TaskChangeActivity[]>([]);
   const [commentsLoading, setCommentsLoading] = useState(true);
   const [commentsError, setCommentsError] = useState<string | null>(null);
+  const [resumeNotice, setResumeNotice] = useState<string | null>(null);
   const [commentSegments, setCommentSegments] = useState<InlineMediaSegment[]>(
     () => createInlineMediaSegments(
       taskboardStorage.getItem(`taskboard.comment-draft.${task.id}`) ?? "",
@@ -556,6 +558,7 @@ export function TaskDetail({
     if ((!body && pendingCommentFiles.length === 0 && commentInlineImages.length === 0) || submitting) return;
     setSubmitting(true);
     setCommentsError(null);
+    setResumeNotice(null);
     try {
       const comment = await createComment(task.id, body);
       const [results, inlineAttachments] = await Promise.all([
@@ -579,6 +582,16 @@ export function TaskDetail({
       if (commentAttachmentInputRef.current) commentAttachmentInputRef.current.value = "";
       const failed = results.length - uploaded.length;
       if (failed > 0) setCommentsError(`评论已发布，但有 ${failed} 个附件上传失败。`);
+      const resume = await resumeTaskFromUpdate(task.id, nextComment.id);
+      if (resume.resumed) {
+        setResumeNotice(task.status === "blocked"
+          ? "已通知原执行会话检查新增材料；确认阻碍解除后会自动恢复处理。"
+          : "已通知原执行会话继续处理，卡片会自动恢复为处理中。");
+      } else if (resume.reason === "already_running") {
+        setResumeNotice("原执行会话正在运行；本次评论和附件已保存。");
+      } else if (resume.reason === "no_managed_thread" && (task.status === "blocked" || task.status === "in_review")) {
+        setResumeNotice("材料已保存；这张旧任务没有可自动唤醒的主执行会话，请从卡片中的会话入口继续。");
+      }
       requestAnimationFrame(() => composerRef.current?.focus());
     } catch (error) {
       setCommentsError(messageFor(error));
@@ -1124,6 +1137,7 @@ export function TaskDetail({
               </div>
 
               {commentsError && <div className="comments-error" role="alert">{commentsError}</div>}
+              {resumeNotice && <div className="comments-notice" role="status">{resumeNotice}</div>}
 
               <form className="comment-composer" onSubmit={(event) => { event.preventDefault(); void submitComment(); }}>
                 <div className="composer-author">

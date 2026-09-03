@@ -891,6 +891,7 @@ function parseAiThreadCreate(body) {
     "projectId",
     "issueId",
     "title",
+    "taskboardManaged",
     "model",
     "reasoningEffort",
     "sandbox",
@@ -899,6 +900,14 @@ function parseAiThreadCreate(body) {
     projectId: validateProjectId(body.projectId),
     issueId: parseAiSetting(body.issueId, "issueId", 128),
     title: parseAiSetting(body.title, "title", 160),
+    taskboardManaged: body.taskboardManaged === undefined
+      ? undefined
+      : (() => {
+        if (typeof body.taskboardManaged !== "boolean") {
+          throw new ApiError(400, "INVALID_FIELD", "'taskboardManaged' must be a boolean");
+        }
+        return body.taskboardManaged;
+      })(),
     model: parseAiSetting(body.model, "model", 128),
     reasoningEffort: parseAiSetting(body.reasoningEffort, "reasoningEffort", 64),
     sandbox: parseAiSandbox(body.sandbox),
@@ -1426,8 +1435,9 @@ export function resolveHost(value = process.env.CODEX_TASKBOARD_HOST ?? "0.0.0.0
 
 export function createTaskboardServer(options = {}) {
   const resolved = resolveServerOptions(options);
+  const launcherProcessEnvironment = options.processEnv ?? process.env;
   const codexProcessEnvironment = withoutTaskboardLauncherEnvironment(
-    options.processEnv ?? process.env,
+    launcherProcessEnvironment,
   );
   const routePrefix = resolved.instanceToken ? `/${resolved.instanceToken}` : "";
   const database = new TaskboardDatabase(resolved.databasePath);
@@ -1585,7 +1595,9 @@ export function createTaskboardServer(options = {}) {
     codexStatePath: resolved.codexStatePath,
     manageTaskboardSkillPath: resolved.skillPath,
     processEnv: codexProcessEnvironment,
+    turnProcessEnv: launcherProcessEnvironment,
     resolveContext: resolveAiChatContext,
+    onTaskChanged: (type, task) => events.emit(type, { task }),
   });
   const projectSummary = new ProjectSummaryService({
     database,
@@ -2391,6 +2403,23 @@ export function createTaskboardServer(options = {}) {
         return methodNotAllowed(response, ["GET", "POST"]);
       }
 
+      const taskResumeRoute = pathname.match(/^\/api\/tasks\/([^/]+)\/resume-from-update$/);
+      if (taskResumeRoute) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/tasks/:id/resume-from-update");
+        const taskId = decodeRouteSegment(taskResumeRoute[1], "Task id");
+        const body = await readJson(request);
+        assertPlainObject(body);
+        assertAllowedKeys(body, new Set(["commentId"]));
+        const commentId = stringField(body.commentId, "commentId", { min: 1, max: 128 });
+        const comment = database.getComment(commentId);
+        if (!comment || comment.taskId !== taskId) {
+          throw new ApiError(404, "COMMENT_NOT_FOUND", `Comment '${commentId}' does not belong to task '${taskId}'`);
+        }
+        const result = await aiChat.resumeTaskFromUpdate(taskId, commentId);
+        return sendJson(response, result.resumed ? 202 : 200, result);
+      }
+
       const commentRoute = pathname.match(/^\/api\/comments\/([^/]+)$/);
       if (commentRoute) {
         let id;
@@ -2595,10 +2624,14 @@ export function createTaskboardServer(options = {}) {
         if (!action && request.method === "PATCH") {
           const actor = actorFromRequest(request);
           const { version, changes, threadId, assigneeTarget } = parseTaskPatch(await readJson(request));
+          const previousTask = database.getTask(id);
           if (assigneeTarget !== undefined) {
             changes.assignee = resolveAssignee(assigneeTarget, actor);
           }
           const task = database.updateTask(id, version, changes, threadId, actor);
+          if (previousTask && previousTask.title !== task.title) {
+            aiChat.syncTaskTitle(task, previousTask);
+          }
           events.emit("task.updated", { task });
           return sendJson(response, 200, { task });
         }

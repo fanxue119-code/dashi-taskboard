@@ -62,6 +62,17 @@ function createdDate(value: string) {
     .format(new Date(value))}创建`;
 }
 
+function activityTime(value: string, now: number) {
+  const timestamp = new Date(value).getTime();
+  const elapsedMinutes = Math.max(0, Math.floor((now - timestamp) / 60_000));
+  if (elapsedMinutes < 1) return "刚刚更新";
+  if (elapsedMinutes < 60) return `${elapsedMinutes}分钟前更新`;
+  const elapsedHours = Math.floor(elapsedMinutes / 60);
+  if (elapsedHours < 24) return `${elapsedHours}小时前更新`;
+  return `${new Intl.DateTimeFormat("zh-CN", { month: "numeric", day: "numeric" })
+    .format(new Date(value))}更新`;
+}
+
 function elapsedTime(startedAt: string | null, now: number) {
   if (!startedAt) return "";
   const elapsed = Math.max(0, Math.floor((now - new Date(startedAt).getTime()) / 1000));
@@ -410,6 +421,14 @@ export function TaskCard({
         <span className="card-reference">
           <span className="task-identifier">ID: {task.identifier}</span>
         </span>
+        {variant === "main" && (
+          <span
+            className="task-activity-time"
+            title={`最后活动：${new Date(task.activityUpdatedAt).toLocaleString("zh-CN")}`}
+          >
+            {activityTime(task.activityUpdatedAt, now)}
+          </span>
+        )}
         {presentation.unread && <span className="task-unread-dot" aria-label="有未读更新" />}
         {task.status === "in_review" && onComplete && (
           <button
@@ -444,6 +463,17 @@ export function TaskCard({
 
       {image && (
         <TaskCardMedia key={image} src={image} />
+      )}
+
+      {task.status !== "done" && task.status !== "canceled" && (
+        <div className="task-card-summary" aria-label="任务进度摘要">
+          <p><span>目标</span>{presentation.summary.goal}</p>
+          <p><span>当前</span>{presentation.summary.currentStage}</p>
+          {presentation.summary.lastCompleted && (
+            <p><span>最近</span>{presentation.summary.lastCompleted}</p>
+          )}
+          <p><span>下一步</span>{presentation.summary.nextStep}</p>
+        </div>
       )}
 
       {showsProperties && (

@@ -237,6 +237,9 @@
     if (plugin && plugin.parentElement) {
       const siblings = Array.from(plugin.parentElement.children).filter((child) => child.tagName === "BUTTON");
       if (siblings.length >= 3) return plugin;
+      // Newer Codex sidebars render Plugins as a standalone row. It is still
+      // a valid visual template for the injected Taskboard entry.
+      return plugin;
     }
 
     const firstSection = scroll.querySelector("[data-app-action-sidebar-section]");

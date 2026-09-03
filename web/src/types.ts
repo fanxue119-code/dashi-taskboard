@@ -107,6 +107,7 @@ export interface AiChatRun {
 export interface AiChatTodoProgress {
   completed: number;
   total: number;
+  items: Array<{ text: string; completed: boolean }>;
   eventId: string;
   updatedAt: string;
 }
@@ -115,6 +116,8 @@ export interface AiChatThread {
   id: string;
   title: string;
   status: AiChatThreadStatus;
+  taskboardManaged: boolean;
+  taskboardAutoName: boolean;
   origin: AiChatOrigin;
   codexThreadId: string | null;
   model: string;

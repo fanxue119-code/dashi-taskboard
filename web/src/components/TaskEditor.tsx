@@ -14,6 +14,7 @@ import {
   type TaskPriority,
   type TaskStatus,
 } from "../types";
+import { recommendProjectId } from "../projectRecommendation";
 import {
   CODEX_AGENT_ACTOR,
   actorKey,
@@ -54,11 +55,7 @@ const RECURRENCE_UNITS: Record<Recurrence["unit"], string> = {
   year: "年",
 };
 
-const GLOBAL_TASK_TODO_BLOCKED_MESSAGE = "全局任务不能进入“待认领”，请先选择所属项目，或改为“待立项”。";
-
-function isGlobalTaskTodo(projectId: string, status: TaskStatus): boolean {
-  return projectId === "local" && status === "todo";
-}
+const GLOBAL_PROJECT_ID = "local";
 
 export interface NewTaskEditorDraft {
   projectId: string;
@@ -81,6 +78,7 @@ interface TaskEditorProps {
   initialDraft: NewTaskEditorDraft | null;
   initialProjectId: string;
   projects: Project[];
+  tasks: Task[];
   labels: string[];
   currentUser: ActorIdentity;
   developmentScan: DevelopmentScan;
@@ -132,6 +130,7 @@ export function TaskEditor({
   initialDraft,
   initialProjectId,
   projects,
+  tasks,
   labels: availableLabels,
   currentUser,
   developmentScan,
@@ -147,6 +146,9 @@ export function TaskEditor({
   const attachmentInputRef = useRef<HTMLInputElement>(null);
   const [title, setTitle] = useState(task?.title ?? initialDraft?.title ?? "");
   const [projectId, setProjectId] = useState(task?.projectId ?? initialDraft?.projectId ?? initialProjectId);
+  const [projectManuallySelected, setProjectManuallySelected] = useState(
+    Boolean(task || (initialDraft && initialDraft.projectId !== initialProjectId)),
+  );
   const [description, setDescription] = useState(task?.description ?? "");
   const [descriptionSegments, setDescriptionSegments] = useState<InlineMediaSegment[]>(
     () => initialDraft?.descriptionSegments ?? createInlineMediaSegments(),
@@ -165,6 +167,12 @@ export function TaskEditor({
   const [error, setError] = useState<string | null>(null);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<File[]>(initialDraft?.attachments ?? []);
+
+  const recommendedProjectId = useMemo(() => recommendProjectId({
+    title,
+    description: task ? description : serializeInlineMedia(descriptionSegments),
+    attachmentNames: attachments.map((file) => file.name),
+  }, projects, tasks), [attachments, description, descriptionSegments, projects, task, tasks, title]);
 
   const developmentOptions = useMemo(() => {
     const options = [...developmentScan.contexts];
@@ -188,6 +196,11 @@ export function TaskEditor({
     };
   }, []);
 
+  useEffect(() => {
+    if (task || initialProjectId !== GLOBAL_PROJECT_ID || projectManuallySelected) return;
+    setProjectId(recommendedProjectId ?? GLOBAL_PROJECT_ID);
+  }, [initialProjectId, projectManuallySelected, recommendedProjectId, task]);
+
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!task) {
@@ -204,11 +217,6 @@ export function TaskEditor({
       setError("重复议题需要先设置最早截止日期。");
       return;
     }
-    if (isGlobalTaskTodo(projectId, status)) {
-      setError(GLOBAL_TASK_TODO_BLOCKED_MESSAGE);
-      return;
-    }
-
     setSaving(true);
     setError(null);
     try {
@@ -222,7 +230,7 @@ export function TaskEditor({
         projectId,
         title: cleanTitle,
         description: descriptionValue,
-        status,
+        status: projectId === GLOBAL_PROJECT_ID && status === "todo" ? "backlog" : status,
         priority,
         labels: selectedLabels,
         ...(assigneeTarget ? { assigneeTarget } : {}),
@@ -380,6 +388,7 @@ export function TaskEditor({
                 value={projectId}
                 onChange={(event) => {
                   const nextProjectId = event.target.value;
+                  setProjectManuallySelected(true);
                   setProjectId(nextProjectId);
                   if (nextProjectId !== projectId && nextProjectId !== task?.projectId) {
                     setDevelopmentContext(null);
@@ -388,11 +397,18 @@ export function TaskEditor({
               >
                 {projects.map((project) => (
                   <option value={project.id} key={project.id}>
-                    {project.id === "local" ? "全局（暂未归类）" : project.name}
+                    {project.id === GLOBAL_PROJECT_ID
+                      ? "待立项（暂未确定项目）"
+                      : `${project.name}${project.id === recommendedProjectId ? "（推荐）" : ""}`}
                   </option>
                 ))}
               </select>
             </label>
+            {!task && initialProjectId === GLOBAL_PROJECT_ID && (
+              <span className="project-recommendation-hint">
+                {recommendedProjectId && !projectManuallySelected ? "已自动推荐项目，可下拉修改" : "请选择项目；暂不确定会保存到待立项"}
+              </span>
+            )}
             <TaskPropertyPicker
               value={status}
               options={TASK_STATUSES.map((value) => ({

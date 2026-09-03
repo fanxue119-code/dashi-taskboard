@@ -61,6 +61,7 @@ import { BoardColumn, STATUS_DETAILS } from "./components/BoardColumn";
 import { AiChat, type AiChatOpenThreadRequest } from "./components/AiChat";
 import {
   automaticTaskKey,
+  chooseAutomaticDispatchBatch,
   chooseAutomaticDispatch,
   type AutomaticDispatchEntry,
   type AutomaticDispatchPhase,
@@ -684,6 +685,7 @@ export function App() {
   const [undoNotice, setUndoNotice] = useState<UndoNotice | null>(null);
   const tasksRequestRef = useRef(0);
   const tasksRef = useRef<Task[]>([]);
+  const nativeTaskResumeIdsRef = useRef(new Set<string>());
   const undoSequenceRef = useRef(0);
   const undoStackRef = useRef<UndoOperation[]>([]);
   const undoInFlightRef = useRef(false);
@@ -838,10 +840,27 @@ export function App() {
   );
   const projectChoices = useMemo<ProjectChoice[]>(() => {
     const persistedById = new Map(projects.map((project) => [project.id, project]));
+    // A native Codex project is canonical when a stale local project has the
+    // same name but no repository path. Keep the stale record for history,
+    // but do not expose it as a second selectable project.
+    const canonicalNames = new Set(
+      projects
+        .filter((project) => Boolean(project.workspacePath))
+        .map((project) => project.name),
+    );
+    const hiddenDuplicateIds = new Set(
+      projects
+        .filter((project) => (
+          !project.workspacePath
+          && project.id !== GLOBAL_PROJECT_ID
+          && canonicalNames.has(project.name)
+        ))
+        .map((project) => project.id),
+    );
     const seen = new Set<string>();
     const choices: ProjectChoice[] = [];
     for (const project of hostContext?.projects ?? []) {
-      if (!project.id || !project.name || seen.has(project.id)) continue;
+      if (!project.id || !project.name || seen.has(project.id) || hiddenDuplicateIds.has(project.id)) continue;
       seen.add(project.id);
       choices.push({
         id: project.id,
@@ -852,7 +871,7 @@ export function App() {
       });
     }
     for (const project of projects) {
-      if (seen.has(project.id)) continue;
+      if (seen.has(project.id) || hiddenDuplicateIds.has(project.id)) continue;
       choices.push({
         id: project.id,
         name: project.name,
@@ -1589,7 +1608,8 @@ export function App() {
       const thread = await createAiChatThread({
         projectId: task.projectId,
         issueId: task.id,
-        title: `自动认领 · ${task.identifier}`,
+        title: `Taskboard · ${task.title}`,
+        taskboardManaged: true,
         model: automation.model,
         reasoningEffort: automation.reasoningEffort,
         sandbox: "workspace-write",
@@ -1608,9 +1628,9 @@ export function App() {
       const run = await startAiChatTurn(thread.id, {
         message: [
           `请处理 Taskboard 任务 ${task.identifier}（任务 ID：${task.id}）。这是项目 ${task.projectId} 的自动认领执行轮次。`,
-          "严格遵守 manage-taskboard 协议：先读取任务描述和最新评论；确认仍是 todo 且没有已绑定会话后，使用当前 Codex 会话原子移动到 in_progress，再开始任何业务工作。",
-          "按任务描述、评论和附件完成可验证的工作；完成后先评论改动、验证结果和剩余风险，再用最新版本移动到 in_review，不要直接标记 done。",
-          "如果信息不足、需要用户决定、Taskboard 入口失效或发现任务已有绑定会话，停止业务工作，评论说明原因并保留任务，不要接管、不要无限重试。",
+          "Taskboard 已在本轮启动时把任务原子更新为 in_progress，并将当前会话设为主执行会话；先读取任务描述、最新评论和附件，确认绑定后直接继续，不要重复认领。",
+          "按任务要求完成可验证的工作；持续维护 Todo，让看板展示当前阶段、最近完成和下一步。完成后先评论关键改动、验证结果和剩余风险；成功结束本轮时 Taskboard 会自动进入 in_review，不要直接标记 done。",
+          "如果信息不足或需要用户决定，先评论明确说明缺少什么，再将任务移到 blocked；如果 Taskboard 入口失效或发现任务绑定其他会话，停止业务工作，不要接管、不要无限重试。",
         ].join("\n"),
       });
       const runningThread: AiChatThread = {
@@ -1673,9 +1693,16 @@ export function App() {
     const projectIds = [...new Set(tasks
       .map((task) => task.projectId)
       .filter((projectId) => projectId !== GLOBAL_PROJECT_ID))];
+    const candidates: Task[] = [];
+    const workspacePaths: Record<string, string | null | undefined> = Object.fromEntries(
+      projects
+        .filter((project) => project.id !== GLOBAL_PROJECT_ID)
+        .map((project) => [project.id, deviceWorkspacePaths[project.id] ?? project.workspacePath]),
+    );
     for (const projectId of projectIds) {
       const automation = projectAutomations[projectId];
       if (!automation?.enabledByUser || automation.status !== "ACTIVE") continue;
+      workspacePaths[projectId] = resolveAutomationProjectContext(projectId).workspacePath;
       const projectTasks = tasks.filter((task) => task.projectId === projectId);
       const selection = chooseAutomaticDispatch({
         projectId,
@@ -1686,7 +1713,19 @@ export function App() {
         automationId: automation.automationId,
       });
       for (const skip of selection.skipped) recordAutomaticSkip(skip);
-      if (selection.kind === "dispatch") void dispatchAutomaticTask(selection.task, automation);
+      if (selection.kind === "dispatch") candidates.push(selection.task);
+    }
+    const batch = chooseAutomaticDispatchBatch({
+      candidates,
+      tasks,
+      aiThreads,
+      dispatches: automaticDispatchesRef.current.values(),
+      projectWorkspacePaths: workspacePaths,
+      maxConcurrent: 3,
+    });
+    for (const task of batch) {
+      const automation = projectAutomations[task.projectId];
+      if (automation) void dispatchAutomaticTask(task, automation);
     }
   }, [
     aiThreads,
@@ -1694,10 +1733,29 @@ export function App() {
     automaticDispatchRevision,
     dispatchAutomaticTask,
     localAiChatAvailable,
+    deviceWorkspacePaths,
     projectAutomations,
+    projects,
     recordAutomaticSkip,
+    resolveAutomationProjectContext,
     tasks,
   ]);
+
+  // State changes trigger dispatch immediately. The configured interval is
+  // also a lightweight retry heartbeat so a transient hydration or launcher
+  // failure does not leave an eligible todo task idle forever.
+  useEffect(() => {
+    if (!localAiChatAvailable) return;
+    const activeIntervals = Object.values(projectAutomations)
+      .filter((automation) => automation.enabledByUser && automation.status === "ACTIVE")
+      .map((automation) => automation.intervalMinutes);
+    if (activeIntervals.length === 0) return;
+    const intervalMinutes = Math.min(...activeIntervals);
+    const timer = window.setInterval(() => {
+      setAutomaticDispatchRevision((current) => current + 1);
+    }, intervalMinutes * 60_000);
+    return () => window.clearInterval(timer);
+  }, [localAiChatAvailable, projectAutomations]);
 
   useEffect(() => () => {
     const taskKeys = new Set([
@@ -1906,7 +1964,10 @@ export function App() {
   const hasActiveTaskFilters = Boolean(search.trim()) || activeFilterCount > 0;
 
   const trackedCodexThreadIds = useMemo(() => [...new Set(tasks
-    .filter((task) => task.status === "in_progress" && task.threadId)
+    .filter((task) => (
+      (task.status === "in_progress" || task.status === "in_review" || task.status === "blocked")
+      && task.threadId
+    ))
     .map((task) => normalizeCodexThreadId(task.threadId))
     .filter(Boolean))].sort(), [tasks]);
   const trackedCodexThreadIdsKey = trackedCodexThreadIds.join(",");
@@ -1924,6 +1985,31 @@ export function App() {
           setCodexThreadProgress((current) => (
             JSON.stringify(current) === JSON.stringify(progress) ? current : progress
           ));
+          const resumableTasks = tasksRef.current.filter((task) => {
+            if (task.status !== "in_review" || !task.threadId) {
+              return false;
+            }
+            const threadId = normalizeCodexThreadId(task.threadId);
+            return Boolean(threadId && progress[threadId]?.running);
+          });
+          for (const task of resumableTasks) {
+            if (nativeTaskResumeIdsRef.current.has(task.id)) continue;
+            nativeTaskResumeIdsRef.current.add(task.id);
+            void moveTaskRequest(task, "in_progress", task.sortOrder, task.threadId ?? undefined)
+              .then((moved) => {
+                if (disposed) return;
+                setTasks((current) => sortTasks([
+                  ...current.filter((candidate) => candidate.id !== moved.id),
+                  moved,
+                ]));
+              })
+              .catch((error) => {
+                if (!disposed) {
+                  setActionError(`${task.identifier} 已恢复执行，但状态自动同步失败：${errorMessage(error)}`);
+                }
+              })
+              .finally(() => nativeTaskResumeIdsRef.current.delete(task.id));
+          }
         }
       } catch {}
     };
@@ -3251,6 +3337,7 @@ export function App() {
           initialDraft={editor.task ? null : newTaskDraft}
           initialProjectId={selectedProjectId}
           projects={projects}
+          tasks={tasks}
           labels={availableLabels}
           currentUser={currentUser}
           developmentScan={developmentScan}

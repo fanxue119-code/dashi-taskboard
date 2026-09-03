@@ -165,6 +165,10 @@ function parseAiChatTodoProgress(row) {
     return {
       completed: items.filter((item) => item.completed === true).length,
       total: items.length,
+      items: items.map((item) => ({
+        text: item.text.trim(),
+        completed: item.completed === true,
+      })),
       eventId: row.id,
       updatedAt: row.created_at,
     };
@@ -328,6 +332,8 @@ function aiChatThreadFromRow(row) {
     id: row.id,
     title: row.title,
     status: row.status,
+    taskboardManaged: row.taskboard_managed === 1,
+    taskboardAutoName: row.taskboard_auto_name === 1,
     origin: {
       projectId: row.origin_project_id,
       projectName: row.origin_project_name,
@@ -509,6 +515,8 @@ export class TaskboardDatabase {
         origin_issue_id TEXT,
         origin_issue_identifier TEXT,
         codex_thread_id TEXT,
+        taskboard_managed INTEGER NOT NULL DEFAULT 0 CHECK (taskboard_managed IN (0, 1)),
+        taskboard_auto_name INTEGER NOT NULL DEFAULT 0 CHECK (taskboard_auto_name IN (0, 1)),
         model TEXT NOT NULL,
         reasoning_effort TEXT NOT NULL,
         sandbox TEXT NOT NULL CHECK (sandbox IN (
@@ -560,6 +568,27 @@ export class TaskboardDatabase {
     if (!projectColumns.some((column) => column.name === "workspace_path")) {
       this.database.exec("ALTER TABLE projects ADD COLUMN workspace_path TEXT");
     }
+
+    const aiChatThreadColumns = this.database.prepare("PRAGMA table_info(ai_chat_threads)").all();
+    if (!aiChatThreadColumns.some((column) => column.name === "taskboard_managed")) {
+      this.database.exec(
+        "ALTER TABLE ai_chat_threads ADD COLUMN taskboard_managed INTEGER NOT NULL DEFAULT 0 CHECK (taskboard_managed IN (0, 1))",
+      );
+    }
+    const aiChatThreadColumnsWithManaged = this.database.prepare("PRAGMA table_info(ai_chat_threads)").all();
+    if (!aiChatThreadColumnsWithManaged.some((column) => column.name === "taskboard_auto_name")) {
+      this.database.exec(
+        "ALTER TABLE ai_chat_threads ADD COLUMN taskboard_auto_name INTEGER NOT NULL DEFAULT 0 CHECK (taskboard_auto_name IN (0, 1))",
+      );
+      this.database.exec(
+        "UPDATE ai_chat_threads SET taskboard_auto_name = taskboard_managed WHERE taskboard_managed = 1",
+      );
+    }
+    this.database.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS ai_chat_threads_one_taskboard_issue
+        ON ai_chat_threads(origin_project_id, origin_issue_id)
+        WHERE taskboard_managed = 1 AND origin_issue_id IS NOT NULL
+    `);
 
     const taskColumns = this.database.prepare("PRAGMA table_info(tasks)").all();
     const hasThreadId = taskColumns.some((column) => column.name === "thread_id");
@@ -704,6 +733,35 @@ export class TaskboardDatabase {
       `);
       this.database.exec("DROP TABLE task_threads");
     }
+
+    // Conversations created by the pre-V1 automatic dispatcher already own
+    // their task when the task points back to the same native Codex thread.
+    // Adopt only that exact historical shape so current Finance tasks receive
+    // the V1 lifecycle without renaming unrelated or user-created sessions.
+    this.database.exec(`
+      UPDATE ai_chat_threads AS thread
+      SET taskboard_managed = 1,
+          taskboard_auto_name = 0
+      WHERE thread.taskboard_managed = 0
+        AND thread.title LIKE '自动认领 · %'
+        AND thread.origin_issue_id IS NOT NULL
+        AND thread.codex_thread_id IS NOT NULL
+        AND EXISTS (
+          SELECT 1
+          FROM tasks
+          WHERE tasks.id = thread.origin_issue_id
+            AND tasks.project_id = thread.origin_project_id
+            AND tasks.thread_id = thread.codex_thread_id
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM ai_chat_threads AS managed
+          WHERE managed.id != thread.id
+            AND managed.taskboard_managed = 1
+            AND managed.origin_project_id = thread.origin_project_id
+            AND managed.origin_issue_id = thread.origin_issue_id
+        )
+    `);
 
     const attachmentColumns = this.database.prepare("PRAGMA table_info(attachments)").all();
     if (!attachmentColumns.some((column) => column.name === "comment_id")) {
@@ -917,6 +975,21 @@ export class TaskboardDatabase {
     const timestamp = now();
     this.database.exec("BEGIN IMMEDIATE");
     try {
+      const previousSnapshot = this.database.prepare(`
+        SELECT title
+        FROM codex_threads
+        WHERE thread_id = ?
+      `);
+      const releaseManagedThread = this.database.prepare(`
+        UPDATE ai_chat_threads
+        SET taskboard_managed = 0,
+            taskboard_auto_name = 0,
+            updated_at = ?
+        WHERE codex_thread_id = ?
+          AND taskboard_managed = 1
+          AND taskboard_auto_name = 1
+          AND title = ?
+      `);
       const statement = this.database.prepare(`
         INSERT INTO codex_threads (
           thread_id,
@@ -942,6 +1015,10 @@ export class TaskboardDatabase {
           observed_at = excluded.observed_at
       `);
       for (const entry of entries) {
+        const previous = previousSnapshot.get(entry.threadId);
+        if (previous && previous.title !== entry.title) {
+          releaseManagedThread.run(timestamp, entry.threadId, previous.title);
+        }
         statement.run(
           entry.threadId,
           entry.title,
@@ -1172,6 +1249,18 @@ export class TaskboardDatabase {
     `).get(issueRef, issueRef, projectId));
   }
 
+  getTaskboardManagedAiChatThread(projectId, issueId) {
+    const row = this.database.prepare(`
+      SELECT * FROM ai_chat_threads
+      WHERE taskboard_managed = 1
+        AND origin_project_id = ?
+        AND origin_issue_id = ?
+      ORDER BY created_at, id
+      LIMIT 1
+    `).get(projectId, issueId);
+    return row ? this.#aiChatThreadWithCurrentRun(row) : null;
+  }
+
   createAiChatThread(input) {
     const id = input.id ?? randomUUID();
     const timestamp = input.createdAt ?? now();
@@ -1180,9 +1269,9 @@ export class TaskboardDatabase {
         id, title, status,
         origin_project_id, origin_project_name, origin_workspace_path,
         origin_issue_id, origin_issue_identifier,
-        codex_thread_id, model, reasoning_effort, sandbox,
+        codex_thread_id, taskboard_managed, taskboard_auto_name, model, reasoning_effort, sandbox,
         created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       id,
       input.title,
@@ -1193,6 +1282,10 @@ export class TaskboardDatabase {
       input.origin.issueId ?? null,
       input.origin.issueIdentifier ?? null,
       input.codexThreadId ?? null,
+      input.taskboardManaged ? 1 : 0,
+      input.taskboardAutoName === undefined
+        ? (input.taskboardManaged ? 1 : 0)
+        : (input.taskboardAutoName ? 1 : 0),
       input.model,
       input.reasoningEffort,
       input.sandbox,
@@ -1200,6 +1293,35 @@ export class TaskboardDatabase {
       input.updatedAt ?? timestamp,
     );
     return this.getAiChatThread(id);
+  }
+
+  createOrGetTaskboardManagedAiChatThread(input) {
+    if (!input.taskboardManaged || !input.origin.issueId) {
+      return this.createAiChatThread(input);
+    }
+    const existing = this.getTaskboardManagedAiChatThread(
+      input.origin.projectId,
+      input.origin.issueId,
+    );
+    if (existing) return existing;
+
+    try {
+      return this.createAiChatThread(input);
+    } catch (error) {
+      const message = String(error?.message ?? "");
+      const uniqueTaskboardIssue = error?.code === "SQLITE_CONSTRAINT_UNIQUE"
+        || message.includes("ai_chat_threads_one_taskboard_issue")
+        || message.includes(
+          "ai_chat_threads.origin_project_id, ai_chat_threads.origin_issue_id",
+        );
+      if (!uniqueTaskboardIssue) throw error;
+      const winner = this.getTaskboardManagedAiChatThread(
+        input.origin.projectId,
+        input.origin.issueId,
+      );
+      if (winner) return winner;
+      throw error;
+    }
   }
 
   updateAiChatThread(id, changes) {
@@ -1214,13 +1336,14 @@ export class TaskboardDatabase {
       model: "model",
       reasoningEffort: "reasoning_effort",
       sandbox: "sandbox",
+      taskboardAutoName: "taskboard_auto_name",
     };
     const assignments = [];
     const values = [];
     for (const [key, column] of Object.entries(columns)) {
       if (!Object.hasOwn(changes, key)) continue;
       assignments.push(`${column} = ?`);
-      values.push(changes[key]);
+      values.push(key === "taskboardAutoName" ? (changes[key] ? 1 : 0) : changes[key]);
     }
     if (assignments.length === 0) return current;
     assignments.push("updated_at = ?");

@@ -213,6 +213,7 @@ export async function createAiChatThread(input: {
   projectId: string;
   issueId?: string;
   title?: string;
+  taskboardManaged?: boolean;
   model?: string;
   reasoningEffort?: string;
   sandbox?: AiChatSandbox;
@@ -521,6 +522,19 @@ export async function createComment(taskId: string, body: string, threadId?: str
     },
   );
   return data.comment;
+}
+
+export async function resumeTaskFromUpdate(
+  taskId: string,
+  commentId: string,
+): Promise<{
+  resumed: boolean;
+  reason: "task_not_waiting" | "no_managed_thread" | "already_running" | null;
+}> {
+  return request(`/api/tasks/${encodeURIComponent(taskId)}/resume-from-update`, {
+    method: "POST",
+    body: JSON.stringify({ commentId }),
+  });
 }
 
 export async function updateComment(comment: Comment, body: string, threadId?: string): Promise<Comment> {

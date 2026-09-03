@@ -56,10 +56,91 @@ function isRunningThread(thread: AiChatThread): boolean {
   return thread.status === "running" || thread.currentRun?.status === "running";
 }
 
+const PRIORITY_RANK = { urgent: 4, high: 3, medium: 2, low: 1, none: 0 } as const;
+
+function day(value: Date): string {
+  const local = new Date(value.getTime() - value.getTimezoneOffset() * 60_000);
+  return local.toISOString().slice(0, 10);
+}
+
+export function compareAutomaticDispatchTasks(left: Task, right: Task, today = day(new Date())): number {
+  const leftDueNow = Boolean(left.dueDate && left.dueDate <= today);
+  const rightDueNow = Boolean(right.dueDate && right.dueDate <= today);
+  if (leftDueNow !== rightDueNow) return leftDueNow ? -1 : 1;
+  if (left.dueDate !== right.dueDate) {
+    if (!left.dueDate) return 1;
+    if (!right.dueDate) return -1;
+    return left.dueDate.localeCompare(right.dueDate);
+  }
+  const priorityDifference = PRIORITY_RANK[right.priority] - PRIORITY_RANK[left.priority];
+  return priorityDifference || left.createdAt.localeCompare(right.createdAt);
+}
+
 function sortTodoTasks(tasks: Task[]): Task[] {
   return tasks
     .filter((task) => task.status === "todo")
-    .sort((left, right) => left.sortOrder - right.sortOrder || left.createdAt.localeCompare(right.createdAt));
+    .sort((left, right) => compareAutomaticDispatchTasks(left, right));
+}
+
+function normalizedWorkspacePath(value: string | null | undefined): string | null {
+  const normalized = value?.trim().replaceAll("\\", "/").replace(/\/{2,}/g, "/").replace(/\/$/, "");
+  return normalized || null;
+}
+
+function taskWorkspacePath(task: Task, projectWorkspacePaths: Record<string, string | null | undefined>): string | null {
+  return normalizedWorkspacePath(
+    task.developmentContext?.type === "worktree"
+      ? task.developmentContext.path
+      : projectWorkspacePaths[task.projectId],
+  );
+}
+
+export function chooseAutomaticDispatchBatch(input: {
+  candidates: Task[];
+  tasks: Task[];
+  aiThreads: AiChatThread[];
+  dispatches: Iterable<AutomaticDispatchEntry>;
+  projectWorkspacePaths: Record<string, string | null | undefined>;
+  maxConcurrent?: number;
+}): Task[] {
+  const maxConcurrent = input.maxConcurrent ?? 3;
+  const activeTaskIds = new Set(
+    input.tasks.filter((task) => task.status === "in_progress").map((task) => task.id),
+  );
+  const occupiedPaths = new Set<string>();
+  for (const task of input.tasks) {
+    if (task.status !== "in_progress") continue;
+    const workspacePath = taskWorkspacePath(task, input.projectWorkspacePaths);
+    if (workspacePath) occupiedPaths.add(workspacePath);
+  }
+  for (const thread of input.aiThreads) {
+    if (!isRunningThread(thread)) continue;
+    if (thread.origin.issueId) activeTaskIds.add(thread.origin.issueId);
+    const workspacePath = normalizedWorkspacePath(thread.origin.workspacePath);
+    if (workspacePath) occupiedPaths.add(workspacePath);
+  }
+  for (const entry of input.dispatches) {
+    if (entry.phase !== "starting" && entry.phase !== "running") continue;
+    activeTaskIds.add(entry.taskId);
+    const entryTask = input.tasks.find((task) => task.id === entry.taskId);
+    const workspacePath = normalizedWorkspacePath(entry.thread?.origin.workspacePath)
+      ?? (entryTask
+        ? taskWorkspacePath(entryTask, input.projectWorkspacePaths)
+        : normalizedWorkspacePath(input.projectWorkspacePaths[entry.projectId]));
+    if (workspacePath) occupiedPaths.add(workspacePath);
+  }
+
+  let capacity = Math.max(0, maxConcurrent - activeTaskIds.size);
+  const selected: Task[] = [];
+  for (const task of [...input.candidates].sort((left, right) => compareAutomaticDispatchTasks(left, right))) {
+    if (capacity === 0) break;
+    const workspacePath = taskWorkspacePath(task, input.projectWorkspacePaths);
+    if (!workspacePath || occupiedPaths.has(workspacePath)) continue;
+    selected.push(task);
+    occupiedPaths.add(workspacePath);
+    capacity -= 1;
+  }
+  return selected;
 }
 
 export function chooseAutomaticDispatch(input: {
@@ -73,11 +154,6 @@ export function chooseAutomaticDispatch(input: {
   if (!input.hydrated) return { kind: "wait", reason: "hydrating", skipped: [] };
   if (input.automationId !== undefined) {
     return { kind: "wait", reason: "legacy-automation-pending", skipped: [] };
-  }
-
-  const projectThreads = input.aiThreads.filter((thread) => thread.origin.projectId === input.projectId);
-  if (projectThreads.some(isRunningThread)) {
-    return { kind: "wait", reason: "running-thread", skipped: [] };
   }
 
   const entries = new Map<string, AutomaticDispatchEntry>();
@@ -104,6 +180,9 @@ export function chooseAutomaticDispatch(input: {
     if (existingThread) {
       if (isRunningThread(existingThread)) {
         return { kind: "wait", reason: "running-thread", skipped };
+      }
+      if (existingThread.taskboardManaged && existingThread.origin.projectId === task.projectId) {
+        return { kind: "dispatch", task, taskKey, skipped };
       }
       skipped.push({ task, taskKey, reason: "existing-local-thread", thread: existingThread });
       continue;

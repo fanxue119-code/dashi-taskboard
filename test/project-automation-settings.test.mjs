@@ -192,6 +192,8 @@ test("todo tasks dispatch through local AI immediately and remain serialized", (
   assert.match(appSource, /if \(!localAiChatAvailable \|\| !aiChatThreadsHydrated\) return/);
   assert.match(appSource, /recordAutomaticSkip\(skip\)/);
   assert.match(appSource, /createAiChatThread\(\{[\s\S]*?issueId: task\.id/);
+  assert.match(appSource, /title: `Taskboard · \$\{task\.title\}`/);
+  assert.match(appSource, /taskboardManaged: true/);
   assert.match(appSource, /startAiChatTurn\(thread\.id/);
   assert.match(appSource, /subscribeAiChatThread\(/);
   assert.match(appSource, /自动认领不会接管已有会话/);

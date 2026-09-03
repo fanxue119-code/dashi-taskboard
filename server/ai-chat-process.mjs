@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-import { withoutTaskboardLauncherEnvironment } from "../shared/codex-environment.mjs";
+import { withTaskboardRuntimeFileEnvironment } from "../shared/codex-environment.mjs";
 
 const VISIBLE_TEXT_LIMIT = 65_536;
 const STDERR_LIMIT = 65_536;
@@ -217,7 +217,11 @@ export function buildCodexArgs(thread, addDirectories, imagePaths = []) {
   return args;
 }
 
-export function buildCodexPrompt(thread, { message, skills, attachmentPaths }, skillPath) {
+export function buildCodexPrompt(
+  thread,
+  { message, skills, attachmentPaths, runtimeFilePath },
+  skillPath,
+) {
   const selectedSkills = skills ?? [];
   const turnAttachmentPaths = attachmentPaths ?? [];
   let selectedSkillIndex = 0;
@@ -238,6 +242,12 @@ export function buildCodexPrompt(thread, { message, skills, attachmentPaths }, s
     context.push(
       "turn_attachment_paths:",
       ...turnAttachmentPaths.map((attachmentPath) => `- ${attachmentPath}`),
+    );
+  }
+  if (typeof runtimeFilePath === "string" && runtimeFilePath.trim()) {
+    context.push(
+      `taskboard_runtime_file: ${runtimeFilePath}`,
+      "taskboard_runtime_rule: every taskctl command in this turn must use the current runtime file above; do not reuse any runtime path from memory, prior conversations, or project files.",
     );
   }
   context.push(
@@ -342,7 +352,7 @@ export function spawnCodexTurn({
 }) {
   const child = spawn(process.execPath, [TURN_OWNER_PATH, executable, JSON.stringify(args)], {
     detached: true,
-    env: withoutTaskboardLauncherEnvironment(env),
+    env: withTaskboardRuntimeFileEnvironment(env),
     stdio: ["pipe", "pipe", "pipe", "pipe"],
   });
 

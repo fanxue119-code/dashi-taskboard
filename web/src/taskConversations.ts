@@ -27,7 +27,35 @@ export interface TaskProcessingPresentation {
 export interface TaskCardPresentation {
   conversations: TaskConversationItem[];
   processing: TaskProcessingPresentation;
+  summary: {
+    goal: string;
+    currentStage: string;
+    lastCompleted: string | null;
+    nextStep: string;
+  };
   unread: boolean;
+}
+
+function compactSummary(value: string, limit = 110) {
+  const compact = value
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, "")
+    .replace(/\[[^\]]+\]\([^)]*\)/g, (match) => match.replace(/^\[|\]\([^)]*\)$/g, ""))
+    .replace(/[#>*_`~-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return compact.length > limit ? `${compact.slice(0, limit - 1)}…` : compact;
+}
+
+function progressItems(value: unknown): Array<{ text: string; completed: boolean }> {
+  if (!value || typeof value !== "object" || !("items" in value)) return [];
+  const items = (value as { items?: unknown }).items;
+  if (!Array.isArray(items)) return [];
+  return items.filter((item): item is { text: string; completed: boolean } => (
+    Boolean(item)
+    && typeof item === "object"
+    && typeof (item as { text?: unknown }).text === "string"
+    && typeof (item as { completed?: unknown }).completed === "boolean"
+  ));
 }
 
 export function normalizeCodexThreadId(value: string | null | undefined) {
@@ -139,9 +167,42 @@ export function taskCardPresentation(
       : taskNativeSession !== undefined
         ? taskNativeTodoProgress
         : conversations.find((conversation) => conversation.latestTodo)?.latestTodo ?? null;
+  const todoItems = progressItems(latestTodo);
+  const incompleteItems = todoItems.filter((item) => !item.completed);
+  const completedItems = todoItems.filter((item) => item.completed);
+  const currentStage = incompleteItems[0]?.text
+    ?? (task.status === "in_review"
+      ? "结果已提交，等待确认"
+      : task.status === "blocked"
+        ? "遇到阻碍，等待补充"
+        : task.status === "todo"
+          ? "等待自动认领"
+          : task.status === "in_progress" && (Boolean(running) || taskNativeSession?.running)
+            ? "正在执行"
+            : task.status === "in_progress"
+              ? "执行会话暂时空闲"
+              : "尚未开始");
+  const nextStep = incompleteItems[1]?.text
+    ?? (task.status === "in_review"
+      ? "确认结果，或提出修改意见"
+      : task.status === "blocked"
+        ? "补充卡片中标明的材料或决定"
+        : task.status === "todo"
+          ? "由 Codex 认领并开始执行"
+          : "完成当前阶段并提交可验收结果");
   return {
     conversations,
     unread,
+    summary: {
+      goal: compactSummary(task.description) || task.title,
+      currentStage: compactSummary(currentStage),
+      lastCompleted: completedItems.length > 0
+        ? compactSummary(completedItems[completedItems.length - 1].text)
+        : task.status === "in_review"
+          ? "已提交本轮结果"
+          : null,
+      nextStep: compactSummary(nextStep),
+    },
     processing: {
       running: task.status === "in_progress"
         && (Boolean(running) || taskNativeSession?.running === true),

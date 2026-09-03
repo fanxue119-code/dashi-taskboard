@@ -33,7 +33,7 @@ test("normalized item events retain a bounded public item id", () => {
   assert.equal(normalized.data.itemId, itemId.slice(0, 65_536));
 });
 
-async function createFixture() {
+async function createFixture({ setCodexThreadName } = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-ai-runner-"));
   const workspacePath = path.join(directory, "workspace");
   const otherWorkspacePath = path.join(directory, "other-workspace");
@@ -44,8 +44,10 @@ async function createFixture() {
   ]);
   const capturePath = path.join(directory, "capture.jsonl");
   const environmentCapturePath = path.join(directory, "environment-capture.jsonl");
+  const runtimeFile = path.join(directory, "launcher-runtime.json");
   const descendantPath = path.join(directory, "descendant-alive");
   const executable = path.join(directory, "fake-codex.mjs");
+  const nativeNameCalls = [];
   await writeFile(executable, `#!/usr/bin/env node
 import { appendFileSync } from "node:fs";
 import { spawn } from "node:child_process";
@@ -54,6 +56,7 @@ if (process.env.FAKE_ENVIRONMENT_CAPTURE_PATH) {
   appendFileSync(process.env.FAKE_ENVIRONMENT_CAPTURE_PATH, JSON.stringify({
     args,
     launcherKeys: Object.keys(process.env).filter((name) => name.startsWith("CODEX_TASKBOARD_")),
+    runtimeFile: process.env.CODEX_TASKBOARD_RUNTIME_FILE || null,
   }) + "\\n");
 }
 if (args[0] === "debug" && args[1] === "models") {
@@ -158,8 +161,12 @@ if (args[0] === "app-server") {
       CODEX_TASKBOARD_INSTANCE_TOKEN: "must-not-reach-codex",
       CODEX_TASKBOARD_INSTANCE_SECRET: "must-not-reach-codex",
       CODEX_TASKBOARD_PORT: "47823",
+      CODEX_TASKBOARD_RUNTIME_FILE: runtimeFile,
       CODEX_TASKBOARD_VERSION: "0.2.0",
     },
+    setCodexThreadName: setCodexThreadName ?? (async (input) => {
+      nativeNameCalls.push(input);
+    }),
     killGraceMs: 50,
   });
   return {
@@ -169,7 +176,9 @@ if (args[0] === "app-server") {
     descendantPath,
     directory,
     environmentCapturePath,
+    nativeNameCalls,
     otherWorkspace,
+    runtimeFile,
     service,
     workspace,
     async close() {
@@ -200,28 +209,131 @@ test("Codex turns use stdin, explicit resume ids, server-owned cwd and sanitized
       scope: "repo",
     }]);
 
+    const task = fixture.database.createTask({
+      projectId: "project",
+      title: "Finance 流水账",
+      description: "",
+      status: "todo",
+      priority: "none",
+      labels: [],
+      threadId: null,
+      actor: { type: "user", id: "local-user", name: "本地用户", avatarUrl: null },
+      assignee: { type: "user", id: "local-user", name: "本地用户", avatarUrl: null },
+      workflowId: null,
+      developmentContext: null,
+      startDate: null,
+      dueDate: null,
+      recurrence: null,
+    });
     const thread = await fixture.service.createThread({
       projectId: "project",
+      issueId: task.id,
+      taskboardManaged: true,
       model: "gpt-real",
       reasoningEffort: "high",
       sandbox: "workspace-write",
     });
     assert.equal(thread.origin.workspacePath, fixture.workspace);
+    assert.equal(thread.title, "Taskboard · Finance 流水账");
+    assert.equal(thread.taskboardManaged, true);
 
     const first = await fixture.service.startTurn(thread.id, {
       message: "HIDDEN_SENTINEL \uFFFC first",
       skillIds: ["real-skill"],
     });
+    assert.equal(fixture.database.getTask(task.id).status, "in_progress");
     await waitFor(() => fixture.service.getRun(first.id)?.status !== "running");
+    assert.equal(fixture.database.getTask(task.id).status, "in_review");
+    assert.equal(fixture.database.getTask(task.id).threadId, "codex-thread-1");
     const second = await fixture.service.startTurn(thread.id, { message: "second" });
+    assert.equal(fixture.database.getTask(task.id).status, "in_progress");
     await waitFor(() => fixture.service.getRun(second.id)?.status !== "running");
+    assert.equal(fixture.database.getTask(task.id).status, "in_review");
+
+    const taskBeforeRename = fixture.database.getTask(task.id);
+    const renamedTask = fixture.database.updateTask(
+      task.id,
+      taskBeforeRename.version,
+      { title: "Finance 现金流" },
+      null,
+      { type: "user", id: "local-user", name: "本地用户", avatarUrl: null },
+    );
+    fixture.service.syncTaskTitle(renamedTask, task);
+    assert.equal(fixture.service.getThread(thread.id).title, "Taskboard · Finance 现金流");
+    await waitFor(() => fixture.nativeNameCalls.length === 3);
+    assert.deepEqual(fixture.nativeNameCalls, [
+      {
+        threadId: "codex-thread-1",
+        name: "Taskboard · Finance 流水账",
+        cwd: fixture.workspace,
+      },
+      {
+        threadId: "codex-thread-1",
+        name: "Taskboard · Finance 流水账",
+        cwd: fixture.workspace,
+      },
+      {
+        threadId: "codex-thread-1",
+        name: "Taskboard · Finance 现金流",
+        cwd: fixture.workspace,
+      },
+    ]);
+
+    const custom = await fixture.service.updateThread(thread.id, { title: "Snow 自定义会话" });
+    assert.equal(custom.title, "Snow 自定义会话");
+    assert.equal(custom.taskboardManaged, true);
+    assert.equal(custom.taskboardAutoName, false);
+    const duplicate = await fixture.service.createThread({
+      projectId: "project",
+      issueId: task.id,
+      taskboardManaged: true,
+      model: "gpt-real",
+      reasoningEffort: "high",
+      sandbox: "workspace-write",
+    });
+    assert.equal(duplicate.id, thread.id);
+    assert.equal(
+      fixture.database.listAiChatThreads().filter((item) => item.origin.issueId === task.id).length,
+      1,
+    );
+    const renamedAgain = fixture.database.updateTask(
+      renamedTask.id,
+      renamedTask.version,
+      { title: "Finance 最终" },
+      null,
+      { type: "user", id: "local-user", name: "本地用户", avatarUrl: null },
+    );
+    fixture.service.syncTaskTitle(renamedAgain, renamedTask);
+    assert.equal(fixture.service.getThread(thread.id).title, "Snow 自定义会话");
+    const nativeNameCallCount = fixture.nativeNameCalls.length;
+    const resumed = await fixture.service.startTurn(thread.id, { message: "resume after rename" });
+    await waitFor(() => fixture.service.getRun(resumed.id)?.status !== "running");
+    assert.equal(fixture.nativeNameCalls.length, nativeNameCallCount);
 
     const captures = (await readFile(fixture.capturePath, "utf8")).trim().split("\n").map(JSON.parse);
     const environmentCaptures = (
       await readFile(fixture.environmentCapturePath, "utf8")
     ).trim().split("\n").map(JSON.parse);
     assert.ok(environmentCaptures.length >= 3);
-    assert.equal(environmentCaptures.every((entry) => entry.launcherKeys.length === 0), true);
+    const execEnvironmentCaptures = environmentCaptures.filter((entry) => entry.args[0] === "exec");
+    const discoveryEnvironmentCaptures = environmentCaptures.filter((entry) => (
+      entry.args[0] === "app-server"
+      || (entry.args[0] === "debug" && entry.args[1] === "models")
+    ));
+    assert.ok(execEnvironmentCaptures.length >= 2);
+    assert.ok(discoveryEnvironmentCaptures.length >= 1);
+    assert.equal(
+      execEnvironmentCaptures.every((entry) => (
+        entry.launcherKeys.length === 1
+        && entry.launcherKeys[0] === "CODEX_TASKBOARD_RUNTIME_FILE"
+        && entry.runtimeFile === fixture.runtimeFile
+      )),
+      true,
+    );
+    assert.equal(
+      discoveryEnvironmentCaptures.every((entry) => entry.launcherKeys.length === 0),
+      true,
+    );
     assert.deepEqual(captures[0].args, [
       "exec", "--json", "--color", "never",
       "-C", fixture.workspace,
@@ -239,6 +351,8 @@ test("Codex turns use stdin, explicit resume ids, server-owned cwd and sanitized
       captures[0].prompt,
       /HIDDEN_SENTINEL \[\$real-skill\]\(\/fixture\/real-skill\/SKILL\.md\) first/,
     );
+    assert.match(captures[0].prompt, /taskboard_runtime_file: .*launcher-runtime\.json/);
+    assert.match(captures[0].prompt, /do not reuse any runtime path from memory/);
     assert.deepEqual(captures[1].args, [
       "exec", "--json", "--color", "never",
       "-C", fixture.workspace,
@@ -270,6 +384,232 @@ test("Codex turns use stdin, explicit resume ids, server-owned cwd and sanitized
   }
 });
 
+test("taskboard-managed issue threads are idempotent across duplicate create calls", async () => {
+  const fixture = await createFixture();
+  try {
+    const task = fixture.database.createTask({
+      projectId: "project",
+      title: "Duplicate dispatch task",
+      description: "",
+      status: "todo",
+      priority: "none",
+      labels: [],
+      threadId: null,
+      actor: { type: "user", id: "local-user", name: "本地用户", avatarUrl: null },
+      assignee: { type: "user", id: "local-user", name: "本地用户", avatarUrl: null },
+      workflowId: null,
+      developmentContext: null,
+      startDate: null,
+      dueDate: null,
+      recurrence: null,
+    });
+    const input = {
+      projectId: "project",
+      issueId: task.id,
+      taskboardManaged: true,
+      model: "gpt-real",
+      reasoningEffort: "high",
+      sandbox: "workspace-write",
+    };
+    const threads = await Promise.all([
+      fixture.service.createThread(input),
+      fixture.service.createThread(input),
+    ]);
+    assert.equal(threads[0].id, threads[1].id);
+    assert.equal(threads[0].taskboardManaged, true);
+    assert.equal(
+      fixture.database.listAiChatThreads().filter((thread) => thread.origin.issueId === task.id).length,
+      1,
+    );
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("task updates resume the existing managed thread without prematurely clearing blockers", async () => {
+  const fixture = await createFixture();
+  try {
+    const task = fixture.database.createTask({
+      projectId: "project",
+      title: "Resume blocked finance task",
+      description: "Wait for the missing statement",
+      status: "blocked",
+      priority: "none",
+      labels: [],
+      threadId: null,
+      actor: { type: "user", id: "local-user", name: "本地用户", avatarUrl: null },
+      assignee: { type: "user", id: "local-user", name: "本地用户", avatarUrl: null },
+      workflowId: null,
+      developmentContext: null,
+      startDate: null,
+      dueDate: null,
+      recurrence: null,
+    });
+    const thread = await fixture.service.createThread({
+      projectId: "project",
+      issueId: task.id,
+      taskboardManaged: true,
+      model: "gpt-real",
+      reasoningEffort: "high",
+      sandbox: "workspace-write",
+    });
+    const comment = fixture.database.createComment(task.id, {
+      body: "两份流水已经补齐，请读取最新附件并继续处理。",
+      threadId: null,
+      actor: { type: "user", id: "local-user", name: "本地用户", avatarUrl: null },
+    });
+
+    const resumed = await fixture.service.resumeTaskFromUpdate(task.id, comment.id);
+    assert.equal(resumed.resumed, true);
+    assert.equal(resumed.thread.id, thread.id);
+    assert.equal(fixture.database.listAiChatThreads().length, 1);
+    assert.equal(fixture.database.getTask(task.id).status, "blocked");
+    await waitFor(() => fixture.service.getRun(resumed.run.id)?.status !== "running");
+    assert.equal(fixture.database.getTask(task.id).status, "blocked");
+
+    const captures = (await readFile(fixture.capturePath, "utf8")).trim().split("\n").map(JSON.parse);
+    assert.match(captures.at(-1).prompt, new RegExp(comment.id));
+    assert.match(captures.at(-1).prompt, /只有确认可以继续时/);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("taskboard-managed native names are serialized and settle on the latest task title", async () => {
+  const nativeNameCalls = [];
+  const releases = [];
+  let visibleNativeName = null;
+  const fixture = await createFixture({
+    setCodexThreadName: async (input) => {
+      nativeNameCalls.push(input);
+      await new Promise((resolve) => releases.push(resolve));
+      visibleNativeName = input.name;
+    },
+  });
+  try {
+    const task = fixture.database.createTask({
+      projectId: "project",
+      title: "Initial task title",
+      description: "",
+      status: "todo",
+      priority: "none",
+      labels: [],
+      threadId: null,
+      actor: { type: "user", id: "local-user", name: "本地用户", avatarUrl: null },
+      assignee: { type: "user", id: "local-user", name: "本地用户", avatarUrl: null },
+      workflowId: null,
+      developmentContext: null,
+      startDate: null,
+      dueDate: null,
+      recurrence: null,
+    });
+    const thread = await fixture.service.createThread({
+      projectId: "project",
+      issueId: task.id,
+      taskboardManaged: true,
+      model: "gpt-real",
+      reasoningEffort: "high",
+      sandbox: "workspace-write",
+    });
+    fixture.database.updateAiChatThread(thread.id, { codexThreadId: "codex-thread-1" });
+
+    const taskA = fixture.database.updateTask(
+      task.id,
+      task.version,
+      { title: "Task title A" },
+      null,
+      { type: "user", id: "local-user", name: "本地用户", avatarUrl: null },
+    );
+    fixture.service.syncTaskTitle(taskA, task);
+    await waitFor(() => nativeNameCalls.length === 1);
+
+    const taskB = fixture.database.updateTask(
+      taskA.id,
+      taskA.version,
+      { title: "Task title B" },
+      null,
+      { type: "user", id: "local-user", name: "本地用户", avatarUrl: null },
+    );
+    fixture.service.syncTaskTitle(taskB, taskA);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(nativeNameCalls.length, 1);
+
+    releases.shift()();
+    await waitFor(() => nativeNameCalls.length === 2);
+    assert.equal(nativeNameCalls[1].name, "Taskboard · Task title B");
+    releases.shift()();
+    await waitFor(() => visibleNativeName === "Taskboard · Task title B");
+  } finally {
+    while (releases.length > 0) releases.shift()();
+    await fixture.close();
+  }
+});
+
+test("a native sidebar rename releases management and resume preserves the custom name", async () => {
+  const fixture = await createFixture();
+  try {
+    const task = fixture.database.createTask({
+      projectId: "project",
+      title: "Native rename task",
+      description: "",
+      status: "todo",
+      priority: "none",
+      labels: [],
+      threadId: null,
+      actor: { type: "user", id: "local-user", name: "本地用户", avatarUrl: null },
+      assignee: { type: "user", id: "local-user", name: "本地用户", avatarUrl: null },
+      workflowId: null,
+      developmentContext: null,
+      startDate: null,
+      dueDate: null,
+      recurrence: null,
+    });
+    const thread = await fixture.service.createThread({
+      projectId: "project",
+      issueId: task.id,
+      taskboardManaged: true,
+      model: "gpt-real",
+      reasoningEffort: "high",
+      sandbox: "workspace-write",
+    });
+
+    const firstRun = await fixture.service.startTurn(thread.id, { message: "create native thread" });
+    await waitFor(() => fixture.service.getRun(firstRun.id)?.status !== "running");
+    await waitFor(() => fixture.nativeNameCalls.length === 1);
+    assert.equal(fixture.service.getThread(thread.id).taskboardManaged, true);
+
+    const automaticSnapshot = {
+      threadId: "codex-thread-1",
+      title: "Taskboard · Native rename task",
+      codexProjectId: "project",
+      codexProjectName: "Project",
+      kind: "local",
+      pinned: false,
+      active: true,
+      running: false,
+      nativeUpdatedAt: null,
+    };
+    fixture.database.upsertCodexThreads([automaticSnapshot]);
+    assert.equal(fixture.service.getThread(thread.id).taskboardManaged, true);
+
+    fixture.database.upsertCodexThreads([{
+      ...automaticSnapshot,
+      title: "Snow 自定义会话",
+    }]);
+    const released = fixture.service.getThread(thread.id);
+    assert.equal(released.taskboardManaged, false);
+    assert.equal(released.taskboardAutoName, false);
+
+    const nativeNameCallCount = fixture.nativeNameCalls.length;
+    const resumed = await fixture.service.startTurn(thread.id, { message: "resume after native rename" });
+    await waitFor(() => fixture.service.getRun(resumed.id)?.status !== "running");
+    assert.equal(fixture.nativeNameCalls.length, nativeNameCallCount);
+    assert.equal(fixture.database.listCodexThreads()[0].title, "Snow 自定义会话");
+  } finally {
+    await fixture.close();
+  }
+});
+
 test("same-thread turns are locked, different threads run concurrently, failures and interrupts settle", async () => {
   const fixture = await createFixture();
   try {
@@ -295,6 +635,43 @@ test("same-thread turns are locked, different threads run concurrently, failures
       ),
       true,
     );
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("a failed taskboard-managed turn moves the owned task to blocked", async () => {
+  const fixture = await createFixture();
+  try {
+    const task = fixture.database.createTask({
+      projectId: "project",
+      title: "Blocked lifecycle",
+      description: "",
+      status: "todo",
+      priority: "none",
+      labels: [],
+      threadId: null,
+      actor: { type: "user", id: "local-user", name: "本地用户", avatarUrl: null },
+      assignee: { type: "user", id: "local-user", name: "本地用户", avatarUrl: null },
+      workflowId: null,
+      developmentContext: null,
+      startDate: null,
+      dueDate: null,
+      recurrence: null,
+    });
+    const thread = await fixture.service.createThread({
+      projectId: "project",
+      issueId: task.id,
+      taskboardManaged: true,
+      model: "gpt-real",
+      reasoningEffort: "high",
+      sandbox: "workspace-write",
+    });
+
+    const run = await fixture.service.startTurn(thread.id, { message: "FAIL" });
+    assert.equal(fixture.database.getTask(task.id).status, "in_progress");
+    await waitFor(() => fixture.service.getRun(run.id)?.status === "failed");
+    assert.equal(fixture.database.getTask(task.id).status, "blocked");
   } finally {
     await fixture.close();
   }

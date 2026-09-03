@@ -3880,6 +3880,20 @@ kbd {
   font-size: 10px;
 }
 
+.comments-notice {
+  margin: 10px 0;
+  color: var(--green-700, #15803d);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.project-recommendation-hint {
+  align-self: center;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
 .comment-composer {
   margin: 18px 0 0;
   overflow: hidden;
@@ -9305,6 +9319,28 @@ kbd {
   height: 100%;
 }
 
+.task-card-summary {
+  display: grid;
+  gap: 3px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--surface-secondary, rgba(127, 127, 127, .07));
+}
+
+.task-card-summary p {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr);
+  gap: 6px;
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 16px;
+}
+
+.task-card-summary p span {
+  color: var(--text-tertiary);
+}
+
 .task-unread-dot {
   display: block;
   flex: 0 0 auto;
@@ -9313,6 +9349,19 @@ kbd {
   border-radius: 50%;
   background: #317cff;
   pointer-events: none;
+}
+
+.task-activity-time {
+  margin-left: auto;
+  color: var(--text-tertiary);
+  font-size: 10px;
+  line-height: 16px;
+  white-space: nowrap;
+}
+
+.task-card.status-in_review .task-activity-time:has(+ .task-unread-dot),
+.task-card.status-in_review .task-activity-time:has(~ .task-card-complete) {
+  margin-left: 0;
 }
 
 .card-properties,

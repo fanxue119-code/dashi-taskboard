@@ -4,6 +4,7 @@ import path from "node:path";
 
 import { ApiError } from "./database.mjs";
 import { discoverAiCatalog, resolveAiWorkspace } from "./ai-chat-catalog.mjs";
+import { setCodexThreadName } from "./codex-app-server.mjs";
 import {
   buildCodexArgs,
   buildCodexPrompt,
@@ -19,6 +20,12 @@ const CODEX_IMAGE_TYPES = new Set([
   "image/png",
   "image/webp",
 ]);
+const TASKBOARD_AGENT = {
+  type: "agent",
+  id: "codex-agent",
+  name: "Codex Agent",
+  avatarUrl: null,
+};
 
 function cappedError(value) {
   const message = value instanceof Error ? value.message : String(value ?? "");
@@ -51,7 +58,14 @@ export class AiChatService {
     this.codexStatePath = options.codexStatePath;
     this.manageTaskboardSkillPath = options.manageTaskboardSkillPath;
     this.processEnv = options.processEnv ?? process.env;
+    this.turnProcessEnv = options.turnProcessEnv ?? this.processEnv;
     this.killGraceMs = options.killGraceMs ?? 1_000;
+    this.setCodexThreadName = options.setCodexThreadName ?? ((input) => setCodexThreadName({
+      ...input,
+      executable: this.codexExecutable,
+      processEnv: this.processEnv,
+    }));
+    this.onTaskChanged = options.onTaskChanged ?? (() => {});
     this.resolveContext = options.resolveContext ?? (async (projectId, issueId) => {
       const resolved = await resolveAiWorkspace(projectId, this.codexStatePath, this.database);
       let issue;
@@ -70,6 +84,7 @@ export class AiChatService {
     this.active = new Map();
     this.listeners = new Map();
     this.completions = new Map();
+    this.codexThreadNameQueues = new Map();
   }
 
   listThreads() {
@@ -141,19 +156,25 @@ export class AiChatService {
     this.#validateSandbox(sandbox);
 
     const issue = resolved.issue;
-
-    return this.database.createAiChatThread({
-      title: input.title ?? issue?.identifier ?? "New conversation",
+    const taskboardManaged = input.taskboardManaged === true && Boolean(issue);
+    const threadInput = {
+      title: input.title ?? (issue ? `Taskboard · ${issue.title}` : "New conversation"),
       origin: {
         projectId: resolved.project.id,
         projectName: resolved.project.name,
         workspacePath: resolved.workspacePath,
         ...(issue ? { issueId: issue.id, issueIdentifier: issue.identifier } : {}),
       },
+      taskboardManaged,
+      taskboardAutoName: taskboardManaged,
       model: model.slug,
       reasoningEffort,
       sandbox,
-    });
+    };
+
+    return taskboardManaged
+      ? this.database.createOrGetTaskboardManagedAiChatThread(threadInput)
+      : this.database.createAiChatThread(threadInput);
   }
 
   async updateThread(threadId, changes) {
@@ -179,7 +200,10 @@ export class AiChatService {
       );
     }
 
-    return this.database.updateAiChatThread(threadId, changes);
+    return this.database.updateAiChatThread(threadId, {
+      ...changes,
+      ...(Object.hasOwn(changes, "title") ? { taskboardAutoName: false } : {}),
+    });
   }
 
   deleteThread(threadId) {
@@ -192,6 +216,22 @@ export class AiChatService {
       );
     }
     return this.database.deleteAiChatThread(threadId);
+  }
+
+  syncTaskTitle(task, previousTask = null) {
+    if (!task?.id || !task.title) return;
+    const name = `Taskboard · ${task.title}`;
+    for (const thread of this.database.listAiChatThreads()) {
+      if (
+        thread.origin.issueId !== task.id
+        || !thread.taskboardManaged
+        || !thread.taskboardAutoName
+      ) continue;
+      const updated = this.database.updateAiChatThread(thread.id, { title: name });
+      if (updated.codexThreadId) {
+        void this.#syncCodexThreadName(updated, updated.codexThreadId, updated.currentRun?.id ?? null);
+      }
+    }
   }
 
   async startTurn(threadId, input) {
@@ -270,9 +310,11 @@ export class AiChatService {
           message: input.message,
           skills: selectedSkills,
           attachmentPaths,
+          runtimeFilePath: this.turnProcessEnv.CODEX_TASKBOARD_RUNTIME_FILE,
         },
         this.manageTaskboardSkillPath,
       );
+      this.#transitionManagedTask(thread, ["todo", "in_review"], "in_progress");
       const run = this.database.createAiChatRun({ threadId });
       this.#emit(threadId, { type: "ai.run", run });
       const userEventData = {};
@@ -294,6 +336,10 @@ export class AiChatService {
       });
       this.#emit(threadId, { type: "ai.event", event: userEvent });
 
+      if (thread.codexThreadId) {
+        void this.#syncCodexThreadName(thread, thread.codexThreadId, run.id);
+      }
+
       const resumingThreadId = thread.codexThreadId;
       let startedThreadId = null;
       let terminalOutcome = null;
@@ -302,7 +348,7 @@ export class AiChatService {
         executable: this.codexExecutable,
         args,
         prompt,
-        env: this.processEnv,
+        env: this.turnProcessEnv,
         onRawEvent: (raw) => {
           const normalized = normalizeCodexEvent(raw);
           if (!normalized) return;
@@ -315,6 +361,8 @@ export class AiChatService {
             }
             startedThreadId = normalized.threadId;
             this.database.updateAiChatThread(threadId, { codexThreadId: normalized.threadId });
+            this.#linkManagedTaskThread(thread, normalized.threadId);
+            void this.#syncCodexThreadName(thread, normalized.threadId, run.id);
             return;
           }
           const event = this.database.insertAiChatEvent({
@@ -366,6 +414,37 @@ export class AiChatService {
       }
       throw error;
     }
+  }
+
+  async resumeTaskFromUpdate(taskId, commentId) {
+    const task = this.database.getTask(taskId);
+    if (!task || task.archivedAt != null) {
+      throw new ApiError(404, "TASK_NOT_FOUND", `Task '${taskId}' does not exist`);
+    }
+    if (task.status !== "blocked" && task.status !== "in_review") {
+      return { resumed: false, reason: "task_not_waiting", thread: null, run: null };
+    }
+
+    const thread = this.database.getTaskboardManagedAiChatThread(task.projectId, task.id);
+    if (!thread) {
+      return { resumed: false, reason: "no_managed_thread", thread: null, run: null };
+    }
+    if (this.#threadIsActive(thread)) {
+      return { resumed: false, reason: "already_running", thread, run: thread.currentRun };
+    }
+
+    const blockedInstructions = task.status === "blocked"
+      ? "任务当前处于 blocked。先读取最新评论和附件，确认新增材料是否真正解除阻碍；只有确认可以继续时，才用 taskctl 将任务移到 in_progress。若仍缺材料，保持 blocked，并评论清楚还缺什么。"
+      : "这是用户对待确认结果的补充或修改要求；本轮启动会自动把任务恢复为 in_progress。";
+    const run = await this.startTurn(thread.id, {
+      message: [
+        `Taskboard 任务 ${task.identifier} 收到了用户的新评论或附件（评论 ID：${commentId}）。`,
+        "请先用 taskctl 重新读取任务、最新评论及该评论的全部附件，只处理这次新增要求，并复用当前主执行会话继续。",
+        blockedInstructions,
+        "完成可验证工作后评论结果；成功结束本轮时 Taskboard 会自动进入 in_review。不要创建或接管其他会话。",
+      ].join("\n"),
+    });
+    return { resumed: true, reason: null, thread: this.getThread(thread.id), run };
   }
 
   async interrupt(runId) {
@@ -512,9 +591,102 @@ export class AiChatService {
     }
   }
 
+  #syncCodexThreadName(thread, codexThreadId, runId) {
+    if (!codexThreadId) return;
+    const previous = this.codexThreadNameQueues.get(codexThreadId);
+    const run = () => this.#syncCodexThreadNameNow(thread, codexThreadId, runId);
+    const next = previous
+      ? previous.catch(() => {}).then(run)
+      : run();
+    this.codexThreadNameQueues.set(codexThreadId, next);
+    const cleanup = () => {
+      if (this.codexThreadNameQueues.get(codexThreadId) === next) {
+        this.codexThreadNameQueues.delete(codexThreadId);
+      }
+    };
+    next.then(cleanup, cleanup);
+    return next;
+  }
+
+  async #syncCodexThreadNameNow(thread, codexThreadId, runId) {
+    const currentThread = this.database.getAiChatThread(thread.id);
+    const issueId = currentThread?.origin.issueId;
+    if (
+      !currentThread?.taskboardManaged
+      || !currentThread.taskboardAutoName
+      || !issueId
+      || !codexThreadId
+    ) return;
+    const task = this.database.getTask(issueId);
+    if (!task || task.projectId !== currentThread.origin.projectId || task.archivedAt != null) return;
+
+    const name = `Taskboard · ${task.title}`;
+    try {
+      await this.setCodexThreadName({
+        threadId: codexThreadId,
+        name,
+        cwd: currentThread.origin.workspacePath,
+      });
+    } catch (error) {
+      try {
+        const event = this.database.insertAiChatEvent({
+          threadId: thread.id,
+          runId,
+          type: "error",
+          role: "error",
+          content: `原生 Codex 会话名称同步失败：${cappedError(error) || "未知错误"}`,
+          data: { status: "failed" },
+        });
+        this.#emit(thread.id, { type: "ai.event", event });
+      } catch {}
+    }
+  }
+
   #threadIsActive(thread) {
     return Boolean(thread.currentRun)
       || [...this.active.values()].some((active) => active.threadId === thread.id);
+  }
+
+  #transitionManagedTask(thread, allowedStatuses, status, codexThreadId) {
+    const issueId = thread?.origin?.issueId;
+    if (!thread?.taskboardManaged || !issueId) return null;
+    const task = this.database.getTask(issueId);
+    if (
+      !task
+      || task.projectId !== thread.origin.projectId
+      || task.archivedAt != null
+      || !allowedStatuses.includes(task.status)
+    ) return task;
+    const updated = this.database.updateTask(
+      task.id,
+      task.version,
+      { status },
+      codexThreadId,
+      TASKBOARD_AGENT,
+    );
+    this.onTaskChanged("task.updated", updated);
+    return updated;
+  }
+
+  #linkManagedTaskThread(thread, codexThreadId) {
+    const issueId = thread?.origin?.issueId;
+    if (!thread?.taskboardManaged || !issueId || !codexThreadId) return null;
+    const task = this.database.getTask(issueId);
+    if (
+      !task
+      || task.projectId !== thread.origin.projectId
+      || task.archivedAt != null
+      || task.threadId === codexThreadId
+    ) return task;
+    const updated = this.database.updateTask(
+      task.id,
+      task.version,
+      {},
+      codexThreadId,
+      TASKBOARD_AGENT,
+    );
+    this.onTaskChanged("task.updated", updated);
+    return updated;
   }
 
   async #finishRun({
@@ -572,6 +744,12 @@ export class AiChatService {
         finishedAt: new Date().toISOString(),
       });
       this.#emit(run.threadId, { type: "ai.run", run: updated });
+      const thread = this.database.getAiChatThread(run.threadId);
+      if (status === "completed") {
+        this.#transitionManagedTask(thread, ["in_progress"], "in_review", thread?.codexThreadId);
+      } else if (status === "failed") {
+        this.#transitionManagedTask(thread, ["in_progress"], "blocked", thread?.codexThreadId);
+      }
       return updated;
     } finally {
       this.active.delete(run.id);

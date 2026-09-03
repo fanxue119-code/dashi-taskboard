@@ -2,6 +2,8 @@
 
 Codex Taskboard 是一个本地优先的任务面板。它可在浏览器中运行，也可通过 macOS App 注入官方 Codex/ChatGPT 客户端。React 界面、`taskctl` CLI 和内置 Codex Skill 使用同一套 HTTP API。
 
+日常创建、自动认领、阻碍恢复和验收流程见 [Taskboard V1 使用说明](./docs/taskboard-v1-user-guide.md)。
+
 ## macOS App
 
 ### 操作路径

@@ -50,6 +50,7 @@ test("the CDP bridge accepts service ensure and native instruction composer pref
   assert.match(source, /if \(keepAlive\) await hostBridge\.install\(\)/);
   assert.match(source, /hostBridge\.publishHeartbeat/);
   assert.match(source, /withoutTaskboardLauncherEnvironment\(process\.env\)/);
+  assert.match(source, /CODEX_TASKBOARD_RUNTIME_FILE: taskboardRuntimeFile/);
 });
 
 test("the CDP bridge exposes only the fixed Taskboard automation operations", () => {

@@ -209,6 +209,10 @@ function startTaskboard({ detached }) {
   return spawn(process.execPath, [path.join(projectRoot, "server", "index.mjs")], {
     cwd: projectRoot,
     detached,
+    env: {
+      ...process.env,
+      CODEX_TASKBOARD_RUNTIME_FILE: taskboardRuntimeFile,
+    },
     stdio,
   });
 }
