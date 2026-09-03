@@ -1222,6 +1222,10 @@ kbd {
   color: var(--text-tertiary);
 }
 
+.project-automation-trigger.is-global {
+  color: var(--text-secondary);
+}
+
 .project-automation-menu {
   position: fixed;
   z-index: 1300;
@@ -1267,6 +1271,56 @@ kbd {
 
 .project-automation-switch .board-setting-switch {
   flex: 0 0 auto;
+}
+
+.project-automation-global-note {
+  margin: -3px 0 9px;
+}
+
+.project-automation-project-list {
+  max-height: 310px;
+  overflow-y: auto;
+}
+
+.project-automation-project {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 42px;
+  gap: 12px;
+  border-top: var(--border-hairline) solid var(--border);
+}
+
+.project-automation-project > span {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.project-automation-project strong {
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 520;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-automation-project small,
+.project-automation-empty {
+  color: var(--text-tertiary);
+  font-size: 10px;
+  line-height: 14px;
+}
+
+.project-automation-project .board-setting-switch {
+  flex: 0 0 auto;
+}
+
+.project-automation-empty {
+  margin: 0;
+  padding: 10px 0 2px;
 }
 
 .project-automation-field select {
@@ -6616,6 +6670,14 @@ kbd {
   max-height: 352px;
   padding: 6px;
   overflow: auto;
+}
+
+.label-options-empty {
+  margin: 0;
+  padding: 9px 8px;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  line-height: 16px;
 }
 
 .label-options button,

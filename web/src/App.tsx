@@ -76,7 +76,10 @@ import {
   type PendingInlineImage,
 } from "./components/InlineMediaComposer";
 import { LinearIcon } from "./components/LinearIcon";
-import { ProjectAutomationMenu } from "./components/ProjectAutomationMenu";
+import {
+  ProjectAutomationMenu,
+  type GlobalAutomationProject,
+} from "./components/ProjectAutomationMenu";
 import { TaskboardIcon } from "./components/TaskboardIcon";
 import { TaskContextMenu } from "./components/TaskContextMenu";
 import { TaskDetail } from "./components/TaskDetail";
@@ -886,6 +889,18 @@ export function App() {
       - (recentOrder.get(right.id) ?? recentProjectIds.length)
     ));
   }, [hostContext?.projects, projects, recentProjectIds]);
+  const globalAutomationProjects = useMemo<GlobalAutomationProject[]>(() => projectChoices
+    .filter((project) => (
+      project.id !== GLOBAL_PROJECT_ID
+      && project.persisted
+      && (project.issueCount > 0 || Boolean(projectAutomations[project.id]))
+    ))
+    .map((project) => ({
+      id: project.id,
+      name: project.name,
+      automation: projectAutomations[project.id],
+      unavailableReason: resolveAutomationProjectContext(project.id).unavailableReason,
+    })), [projectAutomations, projectChoices, resolveAutomationProjectContext]);
   const closeContextMenu = useCallback(() => setContextMenu(null), []);
   const issueReadStorageKey = selectedProjectId
     ? `${ISSUE_READ_KEY_PREFIX}:${taskboardMetadata?.mode ?? "local"}:${selectedProjectId}`
@@ -1115,6 +1130,37 @@ export function App() {
     selectedProjectId,
     writeProjectAutomation,
   ]);
+
+  const saveGlobalProjectAutomation = useCallback(async (
+    projectId: string,
+    options: {
+      enabledByUser: boolean;
+      quotaAware: boolean;
+      intervalMinutes: AutomationIntervalMinutes;
+      model: AutomationModel;
+      reasoningEffort: AutomationReasoningEffort;
+    },
+  ) => {
+    const context = resolveAutomationProjectContext(projectId);
+    if (context.unavailableReason || !context.codexProjectId) {
+      setAutomationError(context.unavailableReason ?? "无法读取项目自动认领配置");
+      return;
+    }
+    setAutomationError(null);
+    const stored = projectAutomationsRef.current[projectId];
+    if (stored?.automationId && !(await pauseLegacyAutomation(projectId, stored))) return;
+    writeProjectAutomation(projectId, {
+      automationId: undefined,
+      codexProjectId: context.codexProjectId,
+      status: options.enabledByUser ? "ACTIVE" : "PAUSED",
+      enabledByUser: options.enabledByUser,
+      quotaAware: false,
+      intervalMinutes: 5,
+      model: options.model,
+      reasoningEffort: options.reasoningEffort,
+    });
+    setAutomaticDispatchRevision((current) => current + 1);
+  }, [pauseLegacyAutomation, resolveAutomationProjectContext, writeProjectAutomation]);
 
   function openTaskDetail(task: Pick<Task, "identifier" | "projectId">) {
     const fullTask = tasksRef.current.find((candidate) => candidate.identifier === task.identifier);
@@ -2805,11 +2851,15 @@ export function App() {
             {selectedProjectId && (
               <ProjectAutomationMenu
                 automation={selectedProjectAutomation}
+                globalProjects={selectedProjectId === GLOBAL_PROJECT_ID ? globalAutomationProjects : undefined}
                 pending={automationPending}
                 error={automationError}
-                unavailableReason={automationProjectContext.unavailableReason}
-                onOpen={() => void reconcileProjectAutomation()}
+                unavailableReason={selectedProjectId === GLOBAL_PROJECT_ID ? null : automationProjectContext.unavailableReason}
+                onOpen={() => {
+                  if (selectedProjectId !== GLOBAL_PROJECT_ID) void reconcileProjectAutomation();
+                }}
                 onChange={(options) => void saveProjectAutomation(options)}
+                onGlobalProjectChange={(projectId, options) => void saveGlobalProjectAutomation(projectId, options)}
               />
             )}
             {selectedProjectId && boardView !== "workflow" && boardView !== "sessions" && (
@@ -3338,7 +3388,6 @@ export function App() {
           initialProjectId={selectedProjectId}
           projects={projects}
           tasks={tasks}
-          labels={availableLabels}
           currentUser={currentUser}
           developmentScan={developmentScan}
           developmentScanLoading={developmentScanLoading}

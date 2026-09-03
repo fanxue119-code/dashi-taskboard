@@ -118,6 +118,9 @@ export function LabelPicker({
             aria-label="搜索标签"
           />
           <div className="label-options" role="listbox" aria-label="可用标签" aria-multiselectable="true">
+            {filteredLabels.length === 0 && !canCreateLabel && (
+              <p className="label-options-empty">当前项目还没有可复用标签，输入名称即可创建。</p>
+            )}
             {filteredLabels.map((label) => {
               const presentation = labelPresentation(label);
               return (

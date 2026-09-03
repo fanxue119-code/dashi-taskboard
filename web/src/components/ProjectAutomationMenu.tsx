@@ -24,13 +24,22 @@ interface AutomationState extends AutomationOptions {
   status: AutomationStatus;
 }
 
+export interface GlobalAutomationProject {
+  id: string;
+  name: string;
+  automation?: Partial<AutomationState>;
+  unavailableReason: string | null;
+}
+
 interface ProjectAutomationMenuProps {
   automation?: Partial<AutomationState>;
+  globalProjects?: GlobalAutomationProject[];
   pending: boolean;
   error: string | null;
   unavailableReason: string | null;
   onOpen: () => void;
   onChange: (options: AutomationOptions) => void;
+  onGlobalProjectChange?: (projectId: string, options: AutomationOptions) => void;
 }
 
 const DEFAULT_OPTIONS: AutomationOptions = {
@@ -52,11 +61,13 @@ const EFFORT_LABELS: Record<AutomationReasoningEffort, string> = {
 
 export function ProjectAutomationMenu({
   automation,
+  globalProjects,
   pending,
   error,
   unavailableReason,
   onOpen,
   onChange,
+  onGlobalProjectChange,
 }: ProjectAutomationMenuProps) {
   const triggerRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
@@ -64,7 +75,13 @@ export function ProjectAutomationMenu({
   const [open, setOpen] = useState(false);
   const [position, setPosition] = useState({ left: 0, top: 0, ready: false });
   const [draft, setDraft] = useState<AutomationOptions>(DEFAULT_OPTIONS);
-  const status = automation?.status ?? "PAUSED";
+  const isGlobal = globalProjects !== undefined;
+  const activeProjectCount = globalProjects?.filter((project) => (
+    project.automation?.enabledByUser && project.automation.status === "ACTIVE"
+  )).length ?? 0;
+  const status = isGlobal
+    ? (activeProjectCount > 0 ? "ACTIVE" : "PAUSED")
+    : automation?.status ?? "PAUSED";
   const stateLabel = !automation?.enabledByUser
     ? "已暂停"
     : status === "ACTIVE"
@@ -134,63 +151,110 @@ export function ProjectAutomationMenu({
       ref={menuRef}
       className="project-automation-menu no-drag"
       role="dialog"
-      aria-label="自动认领待办设置"
+      aria-label={isGlobal ? "全局自动认领设置" : "自动认领待办设置"}
       style={{ left: position.left, top: position.top, visibility: position.ready ? "visible" : "hidden" }}
     >
-      <div className="project-automation-menu-heading">
-        <strong>自动认领待办</strong>
-        <span className={status === "ACTIVE" ? "is-active" : "is-paused"}>
-          {stateLabel}
-        </span>
-      </div>
-      <div className="project-automation-switch">
-        <span>自动认领开关</span>
-        <button
-          type="button"
-          className={`board-setting-switch${draft.enabledByUser ? " is-on" : ""}`}
-          role="switch"
-          aria-checked={draft.enabledByUser}
-          disabled={disabled}
-          onClick={() => submitChange({
-            ...draft,
-            enabledByUser: !draft.enabledByUser,
-          })}
-        >
-          <span aria-hidden="true" />
-        </button>
-      </div>
-      <p className="project-automation-note">
-        任务进入“待认领”后立即触发；MVP 不使用定时扫描或额度自动切换。
-      </p>
-      <label className="project-automation-field">
-        <span>模型</span>
-        <select
-          value={draft.model}
-          disabled={disabled}
-          onChange={(event) => submitChange(withAutomationModel(draft, event.target.value as AutomationModel))}
-        >
-          {AUTOMATION_MODELS.map((model) => (
-            <option key={model.slug} value={model.slug}>{model.label}</option>
-          ))}
-        </select>
-      </label>
-      <label className="project-automation-field">
-        <span>推理强度</span>
-        <select
-          value={draft.reasoningEffort}
-          disabled={disabled}
-          onChange={(event) => submitChange({
-            ...draft,
-            reasoningEffort: event.target.value as AutomationReasoningEffort,
-          })}
-        >
-          {getAutomationModel(draft.model).efforts.map((effort) => (
-            <option key={effort} value={effort}>{EFFORT_LABELS[effort]}</option>
-          ))}
-        </select>
-      </label>
-      {unavailableReason && <p className="project-automation-note">{unavailableReason}</p>}
-      {error && error !== unavailableReason && <p className="project-automation-error" role="alert">{error}</p>}
+      {isGlobal ? (
+        <>
+          <div className="project-automation-menu-heading">
+            <strong>全局自动认领</strong>
+            <span className={activeProjectCount > 0 ? "is-active" : "is-paused"}>
+              {activeProjectCount > 0 ? `已开启 ${activeProjectCount} 个项目` : "全部暂停"}
+            </span>
+          </div>
+          <p className="project-automation-note project-automation-global-note">
+            自动认领仍按项目隔离。你可在这里逐个开关，不会一次性放出所有项目。
+          </p>
+          <div className="project-automation-project-list">
+            {globalProjects.length > 0 ? globalProjects.map((project) => {
+              const options = { ...DEFAULT_OPTIONS, ...project.automation };
+              const projectDisabled = pending || Boolean(project.unavailableReason);
+              return (
+                <div className="project-automation-project" key={project.id}>
+                  <span>
+                    <strong>{project.name}</strong>
+                    {project.unavailableReason && <small>{project.unavailableReason}</small>}
+                  </span>
+                  <button
+                    type="button"
+                    className={`board-setting-switch${options.enabledByUser ? " is-on" : ""}`}
+                    role="switch"
+                    aria-label={`${project.name}自动认领`}
+                    aria-checked={options.enabledByUser}
+                    disabled={projectDisabled}
+                    onClick={() => onGlobalProjectChange?.(project.id, {
+                      ...options,
+                      enabledByUser: !options.enabledByUser,
+                    })}
+                  >
+                    <span aria-hidden="true" />
+                  </button>
+                </div>
+              );
+            }) : (
+              <p className="project-automation-empty">暂无已有任务或已配置自动认领的项目。</p>
+            )}
+          </div>
+          {error && <p className="project-automation-error" role="alert">{error}</p>}
+        </>
+      ) : (
+        <>
+          <div className="project-automation-menu-heading">
+            <strong>自动认领待办</strong>
+            <span className={status === "ACTIVE" ? "is-active" : "is-paused"}>
+              {stateLabel}
+            </span>
+          </div>
+          <div className="project-automation-switch">
+            <span>自动认领开关</span>
+            <button
+              type="button"
+              className={`board-setting-switch${draft.enabledByUser ? " is-on" : ""}`}
+              role="switch"
+              aria-checked={draft.enabledByUser}
+              disabled={disabled}
+              onClick={() => submitChange({
+                ...draft,
+                enabledByUser: !draft.enabledByUser,
+              })}
+            >
+              <span aria-hidden="true" />
+            </button>
+          </div>
+          <p className="project-automation-note">
+            任务进入“待认领”后立即触发；MVP 不使用定时扫描或额度自动切换。
+          </p>
+          <label className="project-automation-field">
+            <span>模型</span>
+            <select
+              value={draft.model}
+              disabled={disabled}
+              onChange={(event) => submitChange(withAutomationModel(draft, event.target.value as AutomationModel))}
+            >
+              {AUTOMATION_MODELS.map((model) => (
+                <option key={model.slug} value={model.slug}>{model.label}</option>
+              ))}
+            </select>
+          </label>
+          <label className="project-automation-field">
+            <span>推理强度</span>
+            <select
+              value={draft.reasoningEffort}
+              disabled={disabled}
+              onChange={(event) => submitChange({
+                ...draft,
+                reasoningEffort: event.target.value as AutomationReasoningEffort,
+              })}
+            >
+              {getAutomationModel(draft.model).efforts.map((effort) => (
+                <option key={effort} value={effort}>{EFFORT_LABELS[effort]}</option>
+              ))}
+            </select>
+          </label>
+          {unavailableReason && <p className="project-automation-note">{unavailableReason}</p>}
+          {error && error !== unavailableReason && <p className="project-automation-error" role="alert">{error}</p>}
+        </>
+      )}
     </div>,
     document.body,
   ) : null;
@@ -200,12 +264,12 @@ export function ProjectAutomationMenu({
       <button
         ref={triggerRef}
         type="button"
-        className={`project-automation-trigger no-drag ${status === "ACTIVE" ? "is-active" : "is-paused"}`}
-        aria-label={status === "ACTIVE" ? "自动认领中" : "自动化"}
+        className={`project-automation-trigger no-drag ${status === "ACTIVE" ? "is-active" : isGlobal ? "is-global" : "is-paused"}`}
+        aria-label={isGlobal ? "全局自动认领设置" : status === "ACTIVE" ? "自动认领中" : "自动化"}
         aria-busy={pending}
         aria-haspopup="dialog"
         aria-expanded={open}
-        title={status === "ACTIVE" ? "自动认领中" : "自动化"}
+        title={isGlobal ? "全局自动认领设置" : status === "ACTIVE" ? "自动认领中" : "自动化"}
         onClick={() => {
           if (!open) {
             setPosition((current) => ({ ...current, ready: false }));
@@ -215,7 +279,9 @@ export function ProjectAutomationMenu({
         }}
       >
         <TaskboardIcon name={status === "ACTIVE" ? "automationPause" : "automationPlay"} />
-        <span>{status === "ACTIVE" ? "自动认领中" : "自动化"}</span>
+        <span>{isGlobal
+          ? activeProjectCount > 0 ? `自动认领 ${activeProjectCount}` : "自动认领设置"
+          : status === "ACTIVE" ? "自动认领中" : "自动化"}</span>
       </button>
       {menu}
     </>

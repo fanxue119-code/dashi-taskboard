@@ -79,7 +79,6 @@ interface TaskEditorProps {
   initialProjectId: string;
   projects: Project[];
   tasks: Task[];
-  labels: string[];
   currentUser: ActorIdentity;
   developmentScan: DevelopmentScan;
   developmentScanLoading: boolean;
@@ -131,7 +130,6 @@ export function TaskEditor({
   initialProjectId,
   projects,
   tasks,
-  labels: availableLabels,
   currentUser,
   developmentScan,
   developmentScanLoading,
@@ -173,6 +171,13 @@ export function TaskEditor({
     description: task ? description : serializeInlineMedia(descriptionSegments),
     attachmentNames: attachments.map((file) => file.name),
   }, projects, tasks), [attachments, description, descriptionSegments, projects, task, tasks, title]);
+
+  const availableLabels = useMemo(() => [...new Set([
+    ...selectedLabels,
+    ...tasks
+      .filter((candidate) => candidate.projectId === projectId)
+      .flatMap((candidate) => candidate.labels),
+  ])], [projectId, selectedLabels, tasks]);
 
   const developmentOptions = useMemo(() => {
     const options = [...developmentScan.contexts];
